@@ -2,11 +2,16 @@
 
 defaults:
   - train
-  - override /task: robotwin_3cam_384_1e-4
+  - override /task: robotwin_uncond_3cam_384_1e-4
   - _self_
 
 ckpt: null
 gpu_id: 0
+
+model:
+  load_text_encoder: true
+  skip_dit_load_from_pretrain: true
+  action_dit_pretrained_path: null
 
 EVALUATION:
   robotwin_root: third_party/RoboTwin
