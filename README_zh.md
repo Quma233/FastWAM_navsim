@@ -299,10 +299,11 @@ robotwin_uncond_3cam_384_1e-4
 如果你觉得我们的工作有帮助，欢迎引用：
 
 ```bibtex
-@misc{yuan2026fastwam,
+@article{yuan2026fastwam,
   title={Fast-WAM: Do World Action Models Need Test-time Future Imagination?},
   author={Tianyuan Yuan and Zibin Dong and Yicheng Liu and Hang Zhao},
+  journal={arXiv preprint arXiv:2603.16666},
   year={2026},
-  note={arXiv preprint arXiv:2603.16666}
+  url={https://arxiv.org/abs/2603.16666}
 }
 ```

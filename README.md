@@ -298,10 +298,11 @@ The RoboTwin evaluation code in this repository is adapted from the official [Ro
 If you find our work helpful, please consider citing:
 
 ```bibtex
-@misc{yuan2026fastwam,
+@article{yuan2026fastwam,
   title={Fast-WAM: Do World Action Models Need Test-time Future Imagination?},
   author={Tianyuan Yuan and Zibin Dong and Yicheng Liu and Hang Zhao},
+  journal={arXiv preprint arXiv:2603.16666},
   year={2026},
-  note={arXiv preprint arXiv:2603.16666}
+  url={https://arxiv.org/abs/2603.16666}
 }
 ```
