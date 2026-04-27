@@ -54,21 +54,47 @@ Default behavior:
 
 ## Environment
 
-Use the FastWAM environment. Example:
+`pip install -e .` only installs the FastWAM package and the dependencies in `pyproject.toml`. It does not install NAVSIM, nuPlan, maps, datasets, metric cache, or model checkpoints.
+
+The simplest recommended setup is to use the helper script in this repository. It mirrors the working container environment: install NAVSIM/nuPlan first, then reinstall the FastWAM-tested torch/numpy/hydra stack.
 
 ```bash
+conda create -n fastwam python=3.10 -y
 conda activate fastwam
+
 cd /path/to/FastWAM_navsim
-pip install -e .
+export NAVSIM_DEVKIT_ROOT=/path/to/navsim_dataset/navsim
+
+bash scripts/setup_navsim_env.sh
 ```
 
-You also need the NAVSIM v1 devkit and dataset available on the training machine. If NAVSIM is not already installed in the environment, install the devkit in editable mode:
+The tested key versions are:
+
+```text
+python              3.10
+torch               2.7.1+cu128
+torchvision         0.22.1+cu128
+numpy               1.26.4
+hydra-core          1.3.2
+accelerate          1.12.0
+deepspeed           0.18.5
+navsim              1.1.0
+nuplan-devkit       1.2.0
+opencv-python       4.9.0.80
+scikit-learn        1.2.2
+positional-encodings 6.0.1
+pytorch-lightning   2.2.1
+tensorboard         2.16.2
+protobuf            4.25.3
+```
+
+If you need a different CUDA wheel index, override it before running the script:
 
 ```bash
-pip install -e /path/to/navsim_dataset/navsim
+CUDA_INDEX_URL=https://download.pytorch.org/whl/cu128 bash scripts/setup_navsim_env.sh
 ```
 
-Set the runtime paths before preprocessing or training:
+After installation, set the runtime paths before preprocessing or training:
 
 ```bash
 export OPENSCENE_DATA_ROOT=/path/to/navsim_dataset/dataset
