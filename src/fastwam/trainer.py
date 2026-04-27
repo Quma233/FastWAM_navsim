@@ -1,4 +1,5 @@
 import logging
+import csv
 import json
 import inspect
 import os
@@ -45,6 +46,11 @@ class Wan22Trainer:
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
+        self.sanitize_nonfinite_gradients = bool(cfg.get("sanitize_nonfinite_gradients", False))
+        self.check_finite_parameters = bool(cfg.get("check_finite_parameters", False))
+        self.optimizer_impl = str(cfg.get("optimizer_impl", "adamw")).strip().lower()
+        self.optimizer_foreach = cfg.get("optimizer_foreach", None)
+        self.optimizer_fused = cfg.get("optimizer_fused", None)
         self.seed = int(cfg.seed)
         
         self.resume = cfg.resume
@@ -63,7 +69,7 @@ class Wan22Trainer:
         )
         
         logger.info(
-            "Accelerate training: distributed_type=%s zero_stage=%s world_size=%d process_index=%d cfg_mixed_precision=%s accelerator_mixed_precision=%s grad_accum=%d grad_clip=%.4f",
+            "Accelerate training: distributed_type=%s zero_stage=%s world_size=%d process_index=%d cfg_mixed_precision=%s accelerator_mixed_precision=%s grad_accum=%d grad_clip=%.4f sanitize_nonfinite_gradients=%s",
             self.accelerator.distributed_type,
             self.accelerator.state.deepspeed_plugin.deepspeed_config.get("zero_optimization", {}).get("stage", "unknown"),
             self.accelerator.num_processes,
@@ -72,6 +78,7 @@ class Wan22Trainer:
             self.accelerator.mixed_precision,
             self.gradient_accumulation_steps,
             self.max_grad_norm,
+            self.sanitize_nonfinite_gradients,
         )
         logger.info("using accelerator.device=%s", self.accelerator.device)
         worker_init_fn = set_global_seed(self.seed, get_worker_init_fn=True)
@@ -86,12 +93,32 @@ class Wan22Trainer:
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
             trainable_params.extend(list(proprio_encoder.parameters()))
-        self.optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-            betas=(0.9, 0.95),
-        )
+        optimizer_kwargs = {
+            "lr": self.learning_rate,
+            "weight_decay": self.weight_decay,
+            "betas": (0.9, 0.95),
+        }
+        if self.optimizer_foreach is not None:
+            optimizer_kwargs["foreach"] = bool(self.optimizer_foreach)
+        if self.optimizer_fused is not None:
+            optimizer_kwargs["fused"] = bool(self.optimizer_fused)
+        if self.optimizer_impl == "adamw":
+            self.optimizer = torch.optim.AdamW(trainable_params, **optimizer_kwargs)
+        elif self.optimizer_impl == "deepspeed_fused_adam":
+            from deepspeed.ops.adam import FusedAdam
+
+            self.optimizer = FusedAdam(
+                trainable_params,
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+                betas=(0.9, 0.95),
+                adam_w_mode=True,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported optimizer_impl={self.optimizer_impl!r}; "
+                "expected 'adamw' or 'deepspeed_fused_adam'."
+            )
         
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
         total_train_steps = self._estimate_total_train_steps()
@@ -157,6 +184,36 @@ class Wan22Trainer:
         if self.wandb_run is None:
             return
         self.wandb_run.log(payload, step=self.global_step)
+
+    def _sanitize_nonfinite_gradients(self) -> int:
+        if not self.sanitize_nonfinite_gradients:
+            return 0
+
+        local_count = torch.zeros((), device=self.accelerator.device, dtype=torch.float32)
+        for param in self.model.parameters():
+            grad = param.grad
+            if grad is None or not grad.is_floating_point():
+                continue
+            finite_mask = torch.isfinite(grad)
+            if bool(finite_mask.all().item()):
+                continue
+            nonfinite_count = (~finite_mask).sum()
+            local_count += nonfinite_count.to(device=local_count.device, dtype=local_count.dtype)
+            torch.nan_to_num_(grad, nan=0.0, posinf=0.0, neginf=0.0)
+
+        total_count = self.accelerator.reduce(local_count, reduction="sum")
+        return int(total_count.item())
+
+    def _find_nonfinite_trainable_parameter(self):
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            tensor = param.detach()
+            if bool(torch.isfinite(tensor).all().item()):
+                continue
+            count = int((~torch.isfinite(tensor)).sum().item())
+            return name, count, tuple(tensor.shape), str(tensor.dtype)
+        return None
 
     def _finish_wandb(self):
         if self.wandb_run is None:
@@ -373,10 +430,158 @@ class Wan22Trainer:
             "action_horizon": action_horizon,
         }
 
+    @staticmethod
+    def _angle_abs_diff(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        diff = pred - target
+        return torch.atan2(torch.sin(diff), torch.cos(diff)).abs()
+
+    @classmethod
+    def _navsim_trajectory_metrics(cls, pred: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+        pred = pred.detach().cpu().float()
+        target = target.detach().cpu().float()
+        if pred.shape != target.shape:
+            raise ValueError(f"NavSIM trajectory shape mismatch: pred={tuple(pred.shape)} target={tuple(target.shape)}")
+        if pred.ndim != 2 or pred.shape[1] != 3:
+            raise ValueError(f"Expected NavSIM trajectory [T,3], got {tuple(pred.shape)}")
+        pos_dist = torch.linalg.norm(pred[:, :2] - target[:, :2], dim=-1)
+        horizon_2s = min(4, pos_dist.shape[0])
+        heading_mae = cls._angle_abs_diff(pred[:, 2], target[:, 2]).mean()
+        return {
+            "traj_l1": float((pred - target).abs().mean().item()),
+            "ade": float(pos_dist.mean().item()),
+            "fde": float(pos_dist[-1].item()),
+            "ade_2s": float(pos_dist[:horizon_2s].mean().item()),
+            "fde_2s": float(pos_dist[horizon_2s - 1].item()),
+            "heading_mae": float(heading_mae.item()),
+        }
+
+    def _gather_object_rows(self, local_rows: list[dict]):
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            gathered = [None for _ in range(self.accelerator.num_processes)] if self.accelerator.is_main_process else None
+            torch.distributed.gather_object(local_rows, gathered, dst=0)
+            if not self.accelerator.is_main_process:
+                return None
+            rows = []
+            for part in gathered:
+                if part:
+                    rows.extend(part)
+            return rows
+        return local_rows
+
+    def _write_navsim_eval_csv(self, rows: list[dict]) -> str:
+        csv_path = os.path.join(self.eval_dir, f"navsim_step_{self.global_step:06d}.csv")
+        fieldnames = []
+        preferred = ["idx", "token", "log_name", "val_loss", "traj_l1", "ade", "fde", "ade_2s", "fde_2s", "heading_mae"]
+        keys = set()
+        for row in rows:
+            keys.update(row.keys())
+        for key in preferred:
+            if key in keys:
+                fieldnames.append(key)
+                keys.remove(key)
+        fieldnames.extend(sorted(keys))
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        return csv_path
+
+    @torch.no_grad()
+    def evaluate_full_dataset(self):
+        if self.val_dataset is None:
+            return None
+        if not hasattr(self.val_dataset, "denormalize_action"):
+            raise TypeError("eval_full_dataset=true requires a validation dataset with denormalize_action().")
+
+        model = self.accelerator.unwrap_model(self.model)
+        was_dit_training = model.dit.training
+        model.eval()
+
+        local_rows: list[dict] = []
+        indices = range(self.accelerator.process_index, len(self.val_dataset), self.accelerator.num_processes)
+        for idx in indices:
+            raw_sample = self.val_dataset[idx]
+            sample = self._to_batched_eval_sample(raw_sample)
+
+            with self.accelerator.autocast():
+                val_loss, _ = model.training_loss(sample)
+            val_loss_value = float(val_loss.detach().float().item())
+
+            video0 = sample["video"][0]
+            action = sample["action"][0] if sample["action"] is not None else None
+            if action is None:
+                raise ValueError("NavSIM full validation requires `action` in samples.")
+            proprio = sample["proprio"][0, 0] if sample["proprio"] is not None else None
+            input_image = video0[:, 0].unsqueeze(0)
+
+            infer_kwargs = {
+                "prompt": None,
+                "input_image": input_image,
+                "action_horizon": sample["action_horizon"],
+                "proprio": proprio,
+                "context": sample["context"][0] if sample["context"] is not None else None,
+                "context_mask": sample["context_mask"][0] if sample["context_mask"] is not None else None,
+                "num_inference_steps": self.eval_num_inference_steps,
+                "seed": 42,
+                "rand_device": "cpu",
+                "tiled": False,
+            }
+            pred = model.infer_action(**infer_kwargs)
+            pred_action = pred["action"]
+
+            pred_action_denorm = self.val_dataset.denormalize_action(pred_action)
+            gt_action_denorm = self.val_dataset.denormalize_action(action.detach().cpu())
+            traj_metrics = self._navsim_trajectory_metrics(pred_action_denorm, gt_action_denorm)
+
+            token = raw_sample.get("token", str(idx))
+            row = {
+                "idx": int(idx),
+                "token": token,
+                "log_name": raw_sample.get("log_name", ""),
+                "val_loss": val_loss_value,
+                **traj_metrics,
+            }
+            if hasattr(self.val_dataset, "compute_pdm_metrics"):
+                pdm_metrics = self.val_dataset.compute_pdm_metrics(pred_action_denorm, token)
+                if pdm_metrics is not None:
+                    row.update(pdm_metrics)
+            local_rows.append(row)
+
+        if was_dit_training:
+            self._set_dit_only_train_mode()
+
+        all_rows = self._gather_object_rows(local_rows)
+        if not self.accelerator.is_main_process:
+            return None
+        if not all_rows:
+            return None
+
+        all_rows = sorted(all_rows, key=lambda row: int(row.get("idx", 0)))
+        csv_path = self._write_navsim_eval_csv(all_rows)
+        numeric_keys = sorted({
+            key
+            for row in all_rows
+            for key, value in row.items()
+            if isinstance(value, (int, float)) and key != "idx"
+        })
+        result = {
+            "eval_mode": "navsim_full",
+            "num_samples": int(len(all_rows)),
+            "csv_path": csv_path,
+        }
+        for key in numeric_keys:
+            values = [float(row[key]) for row in all_rows if key in row and isinstance(row[key], (int, float))]
+            if values:
+                result[key] = float(np.mean(values))
+        logger.info("Saved NAVSIM full validation CSV to %s", csv_path)
+        return result
+
     @torch.no_grad()
     def evaluate(self):
         if self.val_dataset is None:
             return None
+        if bool(self.cfg.get("eval_full_dataset", False)):
+            return self.evaluate_full_dataset()
 
         model = self.accelerator.unwrap_model(self.model)
         was_dit_training = model.dit.training
@@ -672,11 +877,32 @@ class Wan22Trainer:
 
                 with self.accelerator.autocast():
                     loss, loss_dict = train_model.training_loss(sample)
+                if not bool(torch.isfinite(loss.detach()).all().item()):
+                    raise RuntimeError(f"Non-finite training loss at step {self.global_step}: {float(loss.detach().float().item())}")
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
+                    sanitized_gradients = self._sanitize_nonfinite_gradients()
+                    if sanitized_gradients > 0 and self.accelerator.is_main_process:
+                        logger.warning(
+                            "Sanitized %d non-finite gradient values before clipping at step %d.",
+                            sanitized_gradients,
+                            self.global_step + 1,
+                        )
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    grad_norm_tensor_for_check = torch.as_tensor(grad_norm, device=loss.device, dtype=torch.float32)
+                    if not bool(torch.isfinite(grad_norm_tensor_for_check).all().item()):
+                        self.optimizer.zero_grad(set_to_none=True)
+                        raise RuntimeError(f"Non-finite gradient norm after sanitization at step {self.global_step + 1}: {float(grad_norm_tensor_for_check.item())}")
                     self.optimizer.step()
+                    if self.check_finite_parameters:
+                        bad_param = self._find_nonfinite_trainable_parameter()
+                        if bad_param is not None:
+                            name, count, shape, dtype = bad_param
+                            raise RuntimeError(
+                                f"Non-finite trainable parameter after optimizer step {self.global_step + 1}: "
+                                f"name={name} count={count} shape={shape} dtype={dtype}"
+                            )
                     if not self.accelerator.optimizer_step_was_skipped:
                         self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
@@ -706,8 +932,9 @@ class Wan22Trainer:
                         if global_loss_metrics:
                             detail_str = " ".join([f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())])
                             description += detail_str + " "
-                        description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
+                        description += "lr=%.2e grad_norm=%.4f speed=%.2f step/s, %.2f samples/s eta=%s" % (
                             current_lr,
+                            global_grad_norm,
                             steps_per_sec,
                             steps_per_sec * self.batch_size * self.accelerator.num_processes,
                             eta_str,
@@ -717,6 +944,7 @@ class Wan22Trainer:
                         wandb_payload = {
                             "train/loss": global_loss,
                             "train/grad_norm": global_grad_norm,
+                            "train/sanitized_gradients": sanitized_gradients,
                             "train/lr": current_lr,
                             "performance/steps_per_sec": steps_per_sec,
                             "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
@@ -733,31 +961,55 @@ class Wan22Trainer:
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
-                                self.global_step,
-                                metrics["val_loss"],
-                                metrics["psnr_rd"],
-                                metrics["ssim_rd"],
-                            )
-                            if "action_l2" in metrics:
-                                description += " action_l2=%.4f" % metrics["action_l2"]
-                            if "action_l1" in metrics:
-                                description += " action_l1=%.4f" % metrics["action_l1"]
-                            logger.info(description)
-                            eval_payload = {
-                                "eval/val_loss": float(metrics["val_loss"]),
-                                "eval/psnr_rg": float(metrics["psnr_rg"]),
-                                "eval/ssim_rg": float(metrics["ssim_rg"]),
-                                "eval/psnr_rd": float(metrics["psnr_rd"]),
-                                "eval/ssim_rd": float(metrics["ssim_rd"]),
-                                "eval/psnr_dg": float(metrics["psnr_dg"]),
-                                "eval/ssim_dg": float(metrics["ssim_dg"]),
-                            }
-                            if "action_l2" in metrics:
-                                eval_payload["eval/action_l2"] = float(metrics["action_l2"])
-                            if "action_l1" in metrics:
-                                eval_payload["eval/action_l1"] = float(metrics["action_l1"])
-                            self._wandb_log(eval_payload)
+                            if metrics.get("eval_mode") == "navsim_full":
+                                description = (
+                                    "[eval] step=%d samples=%d val_loss=%.4f ADE=%.4f FDE=%.4f traj_l1=%.4f heading_mae=%.4f"
+                                    % (
+                                        self.global_step,
+                                        int(metrics.get("num_samples", 0)),
+                                        metrics["val_loss"],
+                                        metrics["ade"],
+                                        metrics["fde"],
+                                        metrics["traj_l1"],
+                                        metrics["heading_mae"],
+                                    )
+                                )
+                                if "pdm_score" in metrics:
+                                    description += " pdm_score=%.4f" % metrics["pdm_score"]
+                                if "csv_path" in metrics:
+                                    description += " csv=%s" % metrics["csv_path"]
+                                logger.info(description)
+                                eval_payload = {}
+                                for key, value in metrics.items():
+                                    if isinstance(value, (int, float)):
+                                        eval_payload[f"eval/{key}"] = float(value)
+                                self._wandb_log(eval_payload)
+                            else:
+                                description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
+                                    self.global_step,
+                                    metrics["val_loss"],
+                                    metrics["psnr_rd"],
+                                    metrics["ssim_rd"],
+                                )
+                                if "action_l2" in metrics:
+                                    description += " action_l2=%.4f" % metrics["action_l2"]
+                                if "action_l1" in metrics:
+                                    description += " action_l1=%.4f" % metrics["action_l1"]
+                                logger.info(description)
+                                eval_payload = {
+                                    "eval/val_loss": float(metrics["val_loss"]),
+                                    "eval/psnr_rg": float(metrics["psnr_rg"]),
+                                    "eval/ssim_rg": float(metrics["ssim_rg"]),
+                                    "eval/psnr_rd": float(metrics["psnr_rd"]),
+                                    "eval/ssim_rd": float(metrics["ssim_rd"]),
+                                    "eval/psnr_dg": float(metrics["psnr_dg"]),
+                                    "eval/ssim_dg": float(metrics["ssim_dg"]),
+                                }
+                                if "action_l2" in metrics:
+                                    eval_payload["eval/action_l2"] = float(metrics["action_l2"])
+                                if "action_l1" in metrics:
+                                    eval_payload["eval/action_l1"] = float(metrics["action_l1"])
+                                self._wandb_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
                         ckpt_info = self.save_checkpoint()

@@ -105,12 +105,24 @@ PY
   fi
 fi
 
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+OUTPUT_DIR="./runs/${TASK_BASENAME}/${RUN_ID}"
+LOG_FILE="${TRAIN_LOG_FILE:-${OUTPUT_DIR}/train.log}"
+if [[ "${TRAIN_LOG_TO_FILE:-1}" != "0" ]]; then
+  mkdir -p "$(dirname "${LOG_FILE}")"
+  exec > >(tee -a "${LOG_FILE}") 2>&1
+fi
+
 echo "[launch] nproc_per_node=${NPROC_PER_NODE} num_machines=${NUM_MACHINES} machine_rank=${MACHINE_RANK} run_id=${RUN_ID}"
+echo "[launch] output_dir=${OUTPUT_DIR}"
+echo "[launch] log_file=${LOG_FILE}"
+echo "[launch] PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
 
 accelerate launch \
   --config_file scripts/accelerate_configs/accelerate_zero1_ds.yaml \
   --num_processes "${NPROC_PER_NODE}" \
   scripts/train.py \
-  "output_dir=./runs/${TASK_BASENAME}/${RUN_ID}" \
+  "output_dir=${OUTPUT_DIR}" \
   "wandb.name=${TASK_BASENAME}" \
   "${EXTRA_ARGS[@]}"

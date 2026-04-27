@@ -1,0 +1,81 @@
+train:
+  _target_: fastwam.datasets.navsim_v1.NavsimV1FastWAMDataset
+  navsim_log_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/navsim_logs/trainval
+  sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/sensor_blobs/trainval
+  metric_cache_path: ${oc.env:NAVSIM_EXP_ROOT,/path/to/navsim_dataset/exp}/metric_cache
+  split: train
+  split_proportion: 0.95
+  num_future_frames: 8
+  frame_interval: 1
+  has_route: true
+  max_scenes: null
+  camera: CAM_F0
+  video_size: [352, 640]
+  text_embedding_cache_dir: ./data/text_embeds_cache/navsim_v1
+  context_len: 128
+  prompt: "A front camera video from an autonomous vehicle. Predict the ego vehicle's 4-second future trajectory."
+  pretrained_norm_stats: null
+  is_training_set: true
+  shape_meta:
+    action:
+      - key: default
+        raw_shape: 3
+        shape: 3
+    state:
+      - key: default
+        raw_shape: 8
+        shape: 8
+  processor:
+    action_output_dim: 3
+    proprio_output_dim: 8
+  use_stepwise_action_norm: false
+  norm_default_mode: "z-score"
+  norm_exception_mode: null
+
+val:
+  _target_: fastwam.datasets.navsim_v1.NavsimV1FastWAMDataset
+  navsim_log_path: ${data.train.navsim_log_path}
+  sensor_blobs_path: ${data.train.sensor_blobs_path}
+  metric_cache_path: ${data.train.metric_cache_path}
+  split: val
+  split_proportion: ${data.train.split_proportion}
+  num_future_frames: ${data.train.num_future_frames}
+  frame_interval: ${data.train.frame_interval}
+  has_route: ${data.train.has_route}
+  max_scenes: null
+  camera: ${data.train.camera}
+  video_size: ${data.train.video_size}
+  text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
+  context_len: ${data.train.context_len}
+  prompt: ${data.train.prompt}
+  pretrained_norm_stats: null
+  is_training_set: false
+  shape_meta: ${data.train.shape_meta}
+  processor: ${data.train.processor}
+  use_stepwise_action_norm: ${data.train.use_stepwise_action_norm}
+  norm_default_mode: ${data.train.norm_default_mode}
+  norm_exception_mode: ${data.train.norm_exception_mode}
+
+test:
+  _target_: fastwam.datasets.navsim_v1.NavsimV1FastWAMDataset
+  navsim_log_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/navsim_logs/test
+  sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/sensor_blobs/test
+  metric_cache_path: ${data.train.metric_cache_path}
+  split: test
+  split_proportion: ${data.train.split_proportion}
+  num_future_frames: ${data.train.num_future_frames}
+  frame_interval: ${data.train.frame_interval}
+  has_route: ${data.train.has_route}
+  max_scenes: null
+  camera: ${data.train.camera}
+  video_size: ${data.train.video_size}
+  text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
+  context_len: ${data.train.context_len}
+  prompt: ${data.train.prompt}
+  pretrained_norm_stats: null
+  is_training_set: false
+  shape_meta: ${data.train.shape_meta}
+  processor: ${data.train.processor}
+  use_stepwise_action_norm: ${data.train.use_stepwise_action_norm}
+  norm_default_mode: ${data.train.norm_default_mode}
+  norm_exception_mode: ${data.train.norm_exception_mode}

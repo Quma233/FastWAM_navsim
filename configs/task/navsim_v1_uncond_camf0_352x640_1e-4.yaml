@@ -1,0 +1,19 @@
+# @package _global_
+
+defaults:
+  - override /data: navsim_v1
+  - override /model: fastwam
+  - _self_
+
+# dataloading: full NavSIM training defaults for H200-class GPUs while leaving
+# optimizer/model/loss defaults inherited from FastWAM base configs.
+batch_size: 2
+num_workers: 8
+
+# Full validation is expensive; keep complete-val semantics but reduce frequency.
+save_every: 1000
+eval_every: 1000
+
+# NavSIM validation evaluates the full validation split by default.
+eval_full_dataset: true
+optimizer_impl: deepspeed_fused_adam

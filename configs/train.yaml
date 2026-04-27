@@ -28,8 +28,16 @@ gradient_accumulation_steps: 1
 mixed_precision: "bf16" # one of: [no, fp16, bf16]
 seed: 42
 max_grad_norm: 1.0
+sanitize_nonfinite_gradients: false
+check_finite_parameters: false
+optimizer_impl: adamw
+optimizer_foreach: null
+optimizer_fused: null
 weight_decay: 0.0
 resume: null
+
+# script options
+overwrite: true
 
 # wandb
 wandb:

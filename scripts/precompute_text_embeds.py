@@ -58,7 +58,11 @@ def _to_bool(value: Any) -> bool:
 
 def _iter_dataset_nodes(node: Any, path: str = "data"):
     if isinstance(node, DictConfig):
-        if "dataset_dirs" in node and node.get("dataset_dirs") is not None:
+        defines_dataset = (
+            ("dataset_dirs" in node and node.get("dataset_dirs") is not None)
+            or ("text_embedding_cache_dir" in node and node.get("text_embedding_cache_dir") is not None)
+        )
+        if defines_dataset:
             yield path, node
         for key, value in node.items():
             yield from _iter_dataset_nodes(value, f"{path}.{key}")
@@ -71,23 +75,33 @@ def _collect_dataset_settings(data_cfg: DictConfig):
     dataset_dirs: list[str] = []
     cache_dirs: list[Path] = []
     context_lens = set()
+    fixed_prompts: list[str] = []
+    seen_prompts = set()
 
     for node_path, node in _iter_dataset_nodes(data_cfg, path="data"):
+        cache_dir = node.get("text_embedding_cache_dir")
         raw_dirs = node.get("dataset_dirs")
-        if raw_dirs is None:
+        fixed_prompt = node.get("prompt") or node.get("fixed_prompt")
+
+        if cache_dir is None or not str(cache_dir).strip():
+            if raw_dirs is not None:
+                raise ValueError(
+                    f"Missing `text_embedding_cache_dir` for dataset node `{node_path}` "
+                    "(this node defines `dataset_dirs`)."
+                )
             continue
 
-        cache_dir = node.get("text_embedding_cache_dir")
-        if cache_dir is None or not str(cache_dir).strip():
-            raise ValueError(
-                f"Missing `text_embedding_cache_dir` for dataset node `{node_path}` "
-                "(this node defines `dataset_dirs`)."
-            )
+        if raw_dirs is not None:
+            for ds in raw_dirs:
+                ds_str = str(ds)
+                if ds_str not in dataset_dirs:
+                    dataset_dirs.append(ds_str)
 
-        for ds in raw_dirs:
-            ds_str = str(ds)
-            if ds_str not in dataset_dirs:
-                dataset_dirs.append(ds_str)
+        if fixed_prompt is not None and str(fixed_prompt).strip():
+            prompt = str(fixed_prompt)
+            if prompt not in seen_prompts:
+                seen_prompts.add(prompt)
+                fixed_prompts.append(prompt)
 
         cache_dir_path = Path(str(cache_dir)).expanduser()
         if cache_dir_path not in cache_dirs:
@@ -97,9 +111,14 @@ def _collect_dataset_settings(data_cfg: DictConfig):
         if context_len is not None:
             context_lens.add(int(context_len))
 
-        logger.info("Discovered dataset node `%s` with %d dataset_dirs.", node_path, len(raw_dirs))
+        logger.info(
+            "Discovered dataset node `%s` with dataset_dirs=%d fixed_prompt=%s.",
+            node_path,
+            0 if raw_dirs is None else len(raw_dirs),
+            fixed_prompt is not None,
+        )
 
-    return dataset_dirs, cache_dirs, context_lens
+    return dataset_dirs, cache_dirs, context_lens, fixed_prompts
 
 
 def _resolve_context_len(context_lens: set[int]) -> int:
@@ -187,7 +206,7 @@ def main(cfg: DictConfig):
     if cfg.data is None:
         raise ValueError("`cfg.data` is required.")
 
-    dataset_dirs, cache_dirs, context_lens = _collect_dataset_settings(cfg.data)
+    dataset_dirs, cache_dirs, context_lens, fixed_prompts = _collect_dataset_settings(cfg.data)
     if not cache_dirs:
         raise ValueError("No `text_embedding_cache_dir` found under `cfg.data`.")
 
@@ -196,9 +215,12 @@ def main(cfg: DictConfig):
     if override_prompt is not None:
         prompts = [override_prompt]
         logger.info("Using override_instruction; skipping dataset scan and encoding exactly 1 prompt.")
+    elif fixed_prompts:
+        prompts = fixed_prompts
+        logger.info("Using %d fixed prompt(s) from dataset config.", len(prompts))
     else:
         if not dataset_dirs:
-            raise ValueError("No `dataset_dirs` found under `cfg.data`.")
+            raise ValueError("No `dataset_dirs` or fixed `prompt` found under `cfg.data`.")
         prompts = _read_unique_prompts(dataset_dirs)
     if not prompts:
         logger.warning("No prompts found from tasks.jsonl; nothing to do.")
