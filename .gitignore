@@ -34,6 +34,7 @@ evaluate_results/
 
 # Vendored devkit files required for offline setup
 !third_party/navsim/requirements.txt
+!requirements/fastwam_navsim_env.txt
 !third_party/nuplan-devkit-v1.2.tar.gz
 
 # Other uncheckable file types

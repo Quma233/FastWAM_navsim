@@ -64,7 +64,7 @@ third_party/navsim
 third_party/nuplan-devkit-v1.2.tar.gz
 ```
 
-`pip install -e .` alone only installs FastWAM and its Python dependencies. Use the setup script below so the vendored devkits and the tested FastWAM dependency versions are installed in the right order.
+`pip install -e .` alone only installs FastWAM and its Python package metadata. Use the setup script below so the vendored devkits are installed first, then the exact package versions from `requirements/fastwam_navsim_env.txt` are installed, and finally this repo is installed in editable mode without dependency resolution.
 
 ```bash
 conda create -n fastwam python=3.10 -y
@@ -73,6 +73,8 @@ conda activate fastwam
 cd /path/to/FastWAM_navsim
 bash scripts/setup_navsim_env.sh
 ```
+
+The lock file `requirements/fastwam_navsim_env.txt` was exported from the working `fastwam` conda environment. It intentionally excludes local editable installs for FastWAM, NAVSIM, and nuPlan because those are installed from this repo's source tree.
 
 The tested key versions are:
 
