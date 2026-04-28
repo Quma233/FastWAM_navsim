@@ -9,7 +9,7 @@ It keeps the original FastWAM model path and training logic as much as possible:
 - FastWAM model code is not changed for the NavSIM data adapter.
 - NavSIM validation runs the full validation dataset by default.
 
-Large runtime artifacts such as Wan2.2 checkpoints, ActionDiT checkpoints, metric caches, text embedding caches, and training outputs are intentionally not stored in git.
+The NAVSIM and nuPlan devkits are vendored under `third_party/` so the training server does not need to clone those repositories. Large runtime artifacts such as datasets, maps, metric caches, Wan2.2 checkpoints, ActionDiT checkpoints, text embedding caches, and training outputs are intentionally not stored in git.
 
 ## Repository Layout
 
@@ -28,6 +28,9 @@ FastWAM_navsim/
 ├── src/fastwam/
 │   ├── datasets/navsim_v1.py
 │   └── trainer.py
+├── third_party/
+│   ├── navsim/                         # vendored NAVSIM devkit
+│   └── nuplan-devkit-v1.2.tar.gz       # vendored nuPlan devkit package
 ├── checkpoints/      # ignored, put downloaded/generated model weights here
 ├── data/             # ignored, text embedding cache can be generated here
 └── runs/             # ignored, training logs/checkpoints/eval CSVs are saved here
@@ -54,17 +57,20 @@ Default behavior:
 
 ## Environment
 
-`pip install -e .` only installs the FastWAM package and the dependencies in `pyproject.toml`. It does not install NAVSIM, nuPlan, maps, datasets, metric cache, or model checkpoints.
+This repo includes the NAVSIM and nuPlan devkits needed by the code:
 
-The simplest recommended setup is to use the helper script in this repository. It mirrors the working container environment: install NAVSIM/nuPlan first, then reinstall the FastWAM-tested torch/numpy/hydra stack.
+```text
+third_party/navsim
+third_party/nuplan-devkit-v1.2.tar.gz
+```
+
+`pip install -e .` alone only installs FastWAM and its Python dependencies. Use the setup script below so the vendored devkits and the tested FastWAM dependency versions are installed in the right order.
 
 ```bash
 conda create -n fastwam python=3.10 -y
 conda activate fastwam
 
 cd /path/to/FastWAM_navsim
-export NAVSIM_DEVKIT_ROOT=/path/to/navsim_dataset/navsim
-
 bash scripts/setup_navsim_env.sh
 ```
 
@@ -94,14 +100,22 @@ If you need a different CUDA wheel index, override it before running the script:
 CUDA_INDEX_URL=https://download.pytorch.org/whl/cu128 bash scripts/setup_navsim_env.sh
 ```
 
-After installation, set the runtime paths before preprocessing or training:
+If you want to use an external NAVSIM or nuPlan devkit instead of the vendored copies, override these paths:
+
+```bash
+NAVSIM_DEVKIT_ROOT=/path/to/navsim \
+NUPLAN_DEVKIT_PACKAGE=/path/to/nuplan-devkit-v1.2.tar.gz \
+bash scripts/setup_navsim_env.sh
+```
+
+After installation, set the runtime paths before preprocessing or training. These paths still point to your local dataset, maps, and experiment/cache directory; they are not included in this repo.
 
 ```bash
 export OPENSCENE_DATA_ROOT=/path/to/navsim_dataset/dataset
 export NUPLAN_MAPS_ROOT=/path/to/navsim_dataset/dataset/maps
 export NUPLAN_MAP_VERSION=nuplan-maps-v1.0
 export NAVSIM_EXP_ROOT=/path/to/navsim_dataset/exp
-export NAVSIM_DEVKIT_ROOT=/path/to/navsim_dataset/navsim
+export NAVSIM_DEVKIT_ROOT=$(pwd)/third_party/navsim
 ```
 
 `configs/data/navsim_v1.yaml` contains placeholder fallback paths under `/path/to/navsim_dataset/...`. In normal use, set the environment variables above instead of editing absolute machine-specific paths into the repo.
@@ -398,6 +412,8 @@ data/*
 *.tar
 *.tar.gz
 ```
+
+Exception: `third_party/nuplan-devkit-v1.2.tar.gz` is intentionally tracked so restricted training machines do not need to clone the nuPlan devkit.
 
 Before pushing to GitHub, verify staged files:
 
