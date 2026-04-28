@@ -74,7 +74,7 @@ cd /path/to/FastWAM_navsim
 bash scripts/setup_navsim_env.sh
 ```
 
-The lock file `requirements/fastwam_navsim_env.txt` was exported from the working `fastwam` conda environment. It intentionally excludes local editable installs for FastWAM, NAVSIM, and nuPlan because those are installed from this repo's source tree.
+The lock file `requirements/fastwam_navsim_env.txt` was exported from the working `fastwam` conda environment. It intentionally excludes local editable installs for FastWAM, NAVSIM, and nuPlan because those are installed from this repo's source tree. The vendored NAVSIM `setup.py` keeps upstream `requirements.txt` for reference but does not publish those old pins as package metadata; the locked environment controls dependency versions.
 
 The tested key versions are:
 

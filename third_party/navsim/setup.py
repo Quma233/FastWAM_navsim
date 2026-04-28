@@ -6,8 +6,13 @@ import setuptools
 script_folder = os.path.dirname(os.path.realpath(__file__))
 os.chdir(script_folder)
 
-with open("requirements.txt") as f:
-    requirements = f.read().splitlines()
+# This vendored copy is installed from FastWAM-NavSIM with --no-deps.
+# Keep requirements.txt in the repository as upstream documentation, but do not
+# expose its old pins as install_requires metadata. Those pins include versions
+# such as torch==2.0.1 and numpy==1.23.4, which conflict with the tested
+# FastWAM-NavSIM environment. The repository-level setup script installs the
+# compatible locked environment explicitly.
+requirements = []
 
 # Installs
 setuptools.setup(
