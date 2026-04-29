@@ -41,6 +41,10 @@ class NavsimV1FastWAMDataset(Dataset):
         shape_meta: Optional[dict[str, Any]] = None,
         split: str = "train",
         split_proportion: float = 0.95,
+        split_mode: str = "official",
+        navsim_split_name: Optional[str] = None,
+        split_config_root: Optional[str] = None,
+        log_split_file: str = "default_train_val_test_log_split.yaml",
         num_future_frames: int = 8,
         frame_interval: int = 1,
         has_route: bool = True,
@@ -64,6 +68,14 @@ class NavsimV1FastWAMDataset(Dataset):
         self.sensor_blobs_path = Path(str(sensor_blobs_path)).expanduser()
         self.split = str(split).lower().strip()
         self.split_proportion = float(split_proportion)
+        self.split_mode = str(split_mode).lower().strip()
+        self.navsim_split_name = (
+            str(navsim_split_name).strip()
+            if navsim_split_name not in (None, "", "null")
+            else ("navtest" if self.split == "test" else "navtrain")
+        )
+        self.split_config_root = self._resolve_split_config_root(split_config_root)
+        self.log_split_file = str(log_split_file)
         self.num_future_frames = int(num_future_frames)
         self.num_video_frames = self.num_future_frames + 1
         self.frame_interval = int(frame_interval)
@@ -85,6 +97,10 @@ class NavsimV1FastWAMDataset(Dataset):
 
         if self.split not in {"train", "val", "test"}:
             raise ValueError(f"Unsupported split={split!r}; expected train/val/test.")
+        if self.split_mode not in {"official", "proportion"}:
+            raise ValueError(
+                f"Unsupported split_mode={split_mode!r}; expected official/proportion."
+            )
         if self.num_future_frames != 8:
             raise ValueError("NavSIM v1 FastWAM adapter expects exactly 8 future frames for 4s horizon.")
         if self.num_video_frames % 4 != 1:
@@ -126,9 +142,11 @@ class NavsimV1FastWAMDataset(Dataset):
         self._metric_cache_checked = False
 
         logger.info(
-            "NAVSIM v1 %s dataset ready: samples=%d log_path=%s camera=%s video_size=%s",
+            "NAVSIM v1 %s dataset ready: samples=%d split_mode=%s navsim_split=%s log_path=%s camera=%s video_size=%s",
             self.split,
             len(self.samples),
+            self.split_mode,
+            self.navsim_split_name,
             self.navsim_log_path,
             self.camera,
             self.video_size,
@@ -170,12 +188,131 @@ class NavsimV1FastWAMDataset(Dataset):
         kwargs[self.camera_attr] = include
         return SensorConfig(**kwargs)
 
+    @staticmethod
+    def _string_list(values: Optional[Any]) -> Optional[list[str]]:
+        if values is None:
+            return None
+        return [str(value) for value in values]
+
+    @staticmethod
+    def _resolve_split_config_root(split_config_root: Optional[str]) -> Path:
+        def candidates_from(root: Path) -> list[Path]:
+            return [root, root / "navsim" / "planning" / "script" / "config"]
+
+        candidates: list[Path] = []
+        if split_config_root not in (None, "", "null"):
+            candidates.extend(candidates_from(Path(str(split_config_root)).expanduser()))
+        navsim_devkit_root = os.environ.get("NAVSIM_DEVKIT_ROOT")
+        if navsim_devkit_root:
+            candidates.extend(candidates_from(Path(navsim_devkit_root).expanduser()))
+        repo_root = Path(__file__).resolve().parents[3]
+        candidates.append(repo_root / "third_party" / "navsim" / "navsim" / "planning" / "script" / "config")
+
+        for candidate in candidates:
+            if (candidate / "common" / "train_test_split").is_dir() and (candidate / "training").is_dir():
+                return candidate
+        return candidates[0]
+
+    def _load_yaml_dict(self, path: Path) -> dict[str, Any]:
+        if not path.is_file():
+            raise FileNotFoundError(f"NAVSIM split config not found: {path}")
+        cfg = OmegaConf.load(path)
+        return OmegaConf.to_container(cfg, resolve=True)
+
+    def _load_train_val_test_logs(self, split: str) -> Optional[list[str]]:
+        path = self.split_config_root / "training" / self.log_split_file
+        cfg = self._load_yaml_dict(path)
+        return self._string_list(cfg.get(f"{split}_logs"))
+
+    def _load_scene_filter_config(self) -> dict[str, Any]:
+        path = (
+            self.split_config_root
+            / "common"
+            / "train_test_split"
+            / "scene_filter"
+            / f"{self.navsim_split_name}.yaml"
+        )
+        return self._load_yaml_dict(path)
+
+    def _build_official_scene_filter(self):
+        from navsim.common.dataclasses import SceneFilter
+
+        filter_cfg = self._load_scene_filter_config()
+        base_log_names = self._string_list(filter_cfg.get("log_names"))
+        split_log_names = self._load_train_val_test_logs(self.split)
+        if split_log_names is None:
+            log_names = base_log_names
+        elif base_log_names is None:
+            log_names = split_log_names
+        else:
+            split_log_set = set(split_log_names)
+            log_names = [log_name for log_name in base_log_names if log_name in split_log_set]
+
+        tokens = self._string_list(filter_cfg.get("tokens"))
+        scene_filter = SceneFilter(
+            num_history_frames=int(filter_cfg.get("num_history_frames", 1)),
+            num_future_frames=int(filter_cfg.get("num_future_frames", max(self.num_future_frames, 0))),
+            frame_interval=filter_cfg.get("frame_interval", self.frame_interval),
+            has_route=bool(filter_cfg.get("has_route", self.has_route)),
+            max_scenes=None,
+            log_names=log_names,
+            tokens=tokens,
+        )
+        return scene_filter
+
+    def _collect_scene_samples(
+        self,
+        scene_loader: Any,
+        current_frame_index: int,
+        filter_missing_images: bool,
+    ) -> list[dict[str, Any]]:
+        samples: list[dict[str, Any]] = []
+        self._scene_frames_by_token = {}
+        for token in scene_loader.tokens:
+            source_window = scene_loader.scene_frames_dicts[token]
+            window = source_window[current_frame_index : current_frame_index + self.num_video_frames]
+            if len(window) != self.num_video_frames:
+                continue
+            if filter_missing_images and not self._window_has_camera_images(window):
+                continue
+            token = str(token)
+            self._scene_frames_by_token[token] = window
+            samples.append(
+                {
+                    "token": token,
+                    "log_name": str(window[0]["log_name"]),
+                    "timestamp": int(window[0]["timestamp"]),
+                }
+            )
+        samples = sorted(samples, key=lambda x: (x["log_name"], x["timestamp"], x["token"]))
+        if self.max_scenes is not None:
+            samples = samples[: self.max_scenes]
+            selected_tokens = {sample["token"] for sample in samples}
+            self._scene_frames_by_token = {
+                token: self._scene_frames_by_token[token] for token in selected_tokens
+            }
+        return samples
+
     def _build_index(self, filter_missing_images: bool) -> list[dict[str, Any]]:
         from navsim.common.dataloader import SceneLoader
         from navsim.common.dataclasses import SceneFilter
 
         if not any(self.navsim_log_path.glob("*.pkl")):
             raise FileNotFoundError(f"No NAVSIM log pickle files found in {self.navsim_log_path}")
+
+        if self.split_mode == "official":
+            scene_filter = self._build_official_scene_filter()
+            scene_loader = SceneLoader(
+                data_path=self.navsim_log_path,
+                sensor_blobs_path=self.sensor_blobs_path,
+                scene_filter=scene_filter,
+                sensor_config=self._sensor_config,
+            )
+            return self._collect_scene_samples(
+                scene_loader=scene_loader,
+                current_frame_index=scene_filter.num_history_frames - 1,
+                filter_missing_images=filter_missing_images,
+            )
 
         scene_filter = SceneFilter(
             num_history_frames=1,
@@ -190,35 +327,16 @@ class NavsimV1FastWAMDataset(Dataset):
             scene_filter=scene_filter,
             sensor_config=self._sensor_config,
         )
-
-        all_samples: list[dict[str, Any]] = []
-        for token in scene_loader.tokens:
-            window = scene_loader.scene_frames_dicts[token]
-            if len(window) != self.num_video_frames:
-                continue
-            if filter_missing_images and not self._window_has_camera_images(window):
-                continue
-            token = str(token)
-            self._scene_frames_by_token[token] = window
-            all_samples.append(
-                {
-                    "token": token,
-                    "log_name": str(window[0]["log_name"]),
-                    "timestamp": int(window[0]["timestamp"]),
-                }
-            )
-            if self.max_scenes is not None and len(all_samples) >= self.max_scenes:
-                break
-
-        all_samples = sorted(all_samples, key=lambda x: (x["log_name"], x["timestamp"], x["token"]))
+        all_samples = self._collect_scene_samples(
+            scene_loader=scene_loader,
+            current_frame_index=0,
+            filter_missing_images=filter_missing_images,
+        )
         split_idx = int(len(all_samples) * self.split_proportion)
         split_idx = min(max(split_idx, 1), max(len(all_samples) - 1, 1))
         if self.split == "train":
             selected = all_samples[:split_idx]
-        elif self.split == "val":
-            selected = all_samples[split_idx:]
         else:
-            # Keep a test interface for full data; on mini, reuse validation slice as placeholder.
             selected = all_samples[split_idx:]
 
         selected_tokens = {sample["token"] for sample in selected}

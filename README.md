@@ -47,6 +47,7 @@ src/fastwam/datasets/navsim_v1.py
 Default behavior:
 
 - NAVSIM official `SceneFilter`, `SensorConfig`, and `SceneLoader` style data loading.
+- Default train/val/test split follows the NAVSIM/Drive-JEPA official log and token split configs, not a fixed sample ratio.
 - Camera: `CAM_F0` only.
 - Input image: current frame only.
 - Video tensor: current frame plus future 8 frames, total 9 frames.
@@ -257,7 +258,7 @@ TRAIN_LOG_TO_FILE=0 bash scripts/train_zero1.sh 8 task=navsim_v1_uncond_camf0_35
 
 ## Main Configuration Files
 
-### Data paths
+### Data paths and splits
 
 Edit or override:
 
@@ -273,23 +274,33 @@ train:
   sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/sensor_blobs/trainval
   metric_cache_path: ${oc.env:NAVSIM_EXP_ROOT,/path/to/navsim_dataset/exp}/metric_cache
   split: train
-  split_proportion: 0.95
+  split_mode: official
+  navsim_split_name: navtrain
+  split_config_root: ./third_party/navsim/navsim/planning/script/config
+  log_split_file: default_train_val_test_log_split.yaml
 
 val:
   navsim_log_path: ${data.train.navsim_log_path}
   sensor_blobs_path: ${data.train.sensor_blobs_path}
   split: val
-  split_proportion: ${data.train.split_proportion}
+  split_mode: ${data.train.split_mode}
+  navsim_split_name: ${data.train.navsim_split_name}
 
 test:
   navsim_log_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/navsim_logs/test
   sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/sensor_blobs/test
   split: test
+  split_mode: ${data.train.split_mode}
+  navsim_split_name: navtest
 ```
 
-By default, train and val are deterministically split from `trainval` using `split_proportion: 0.95`.
+By default, `split_mode: official` matches Drive-JEPA/NAVSIM v1 behavior:
 
-To train on a mini dataset without editing the YAML, set environment variables to the mini root and override paths if needed:
+- `train` and `val` both read `navsim_logs/trainval`, use the `navtrain` scene filter, then intersect its log/token set with official `train_logs` or `val_logs` from `default_train_val_test_log_split.yaml`.
+- `test` reads `navsim_logs/test`, uses the `navtest` scene filter, and intersects with official `test_logs`.
+- The old deterministic sample-ratio split is still available only as an explicit debug fallback with `split_mode=proportion split_proportion=0.95`.
+
+To train on the current mini dataset without editing the YAML, point train/val to the mini folders. The official split logic will use the mini logs that overlap the official train/val log lists.
 
 ```bash
 export OPENSCENE_DATA_ROOT=/data1/jcfu/navsim_dataset_v1/dataset
@@ -299,6 +310,8 @@ bash scripts/train_zero1.sh 2 task=navsim_v1_uncond_camf0_352x640_1e-4 \
   data.train.navsim_log_path=$OPENSCENE_DATA_ROOT/navsim_logs/mini \
   data.train.sensor_blobs_path=$OPENSCENE_DATA_ROOT/sensor_blobs/mini
 ```
+
+For full training, keep the default `trainval` and `test` paths and only set `OPENSCENE_DATA_ROOT` to the full NAVSIM dataset root.
 
 ### Training settings
 

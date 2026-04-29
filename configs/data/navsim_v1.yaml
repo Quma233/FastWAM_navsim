@@ -4,7 +4,10 @@ train:
   sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/sensor_blobs/trainval
   metric_cache_path: ${oc.env:NAVSIM_EXP_ROOT,/path/to/navsim_dataset/exp}/metric_cache
   split: train
-  split_proportion: 0.95
+  split_mode: official
+  navsim_split_name: navtrain
+  split_config_root: ./third_party/navsim/navsim/planning/script/config
+  log_split_file: default_train_val_test_log_split.yaml
   num_future_frames: 8
   frame_interval: 1
   has_route: true
@@ -38,7 +41,10 @@ val:
   sensor_blobs_path: ${data.train.sensor_blobs_path}
   metric_cache_path: ${data.train.metric_cache_path}
   split: val
-  split_proportion: ${data.train.split_proportion}
+  split_mode: ${data.train.split_mode}
+  navsim_split_name: ${data.train.navsim_split_name}
+  split_config_root: ${data.train.split_config_root}
+  log_split_file: ${data.train.log_split_file}
   num_future_frames: ${data.train.num_future_frames}
   frame_interval: ${data.train.frame_interval}
   has_route: ${data.train.has_route}
@@ -62,7 +68,10 @@ test:
   sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/sensor_blobs/test
   metric_cache_path: ${data.train.metric_cache_path}
   split: test
-  split_proportion: ${data.train.split_proportion}
+  split_mode: ${data.train.split_mode}
+  navsim_split_name: navtest
+  split_config_root: ${data.train.split_config_root}
+  log_split_file: ${data.train.log_split_file}
   num_future_frames: ${data.train.num_future_frames}
   frame_interval: ${data.train.frame_interval}
   has_route: ${data.train.has_route}
