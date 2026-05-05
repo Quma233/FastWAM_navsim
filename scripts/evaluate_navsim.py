@@ -1,0 +1,235 @@
+import csv
+import pickle
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Optional
+
+import hydra
+import numpy as np
+import torch
+from hydra.utils import instantiate
+from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
+
+from fastwam.runtime import (
+    _mixed_precision_to_model_dtype,
+    _normalize_mixed_precision,
+    _resolve_train_device,
+)
+from fastwam.trainer import Wan22Trainer
+from fastwam.utils import misc
+from fastwam.utils.config_resolvers import register_default_resolvers
+from fastwam.utils.logging_config import get_logger, setup_logging
+
+logger = get_logger(__name__)
+
+register_default_resolvers()
+
+
+def _resolve_checkpoint_path(cfg: DictConfig) -> Path:
+    checkpoint_path = cfg.get("eval_checkpoint_path", None) or cfg.get("resume", None)
+    if checkpoint_path in (None, "", "null"):
+        raise ValueError("Set `resume=/path/to/checkpoint.pt` or `+eval_checkpoint_path=/path/to/checkpoint.pt`.")
+    checkpoint_path = Path(str(checkpoint_path)).expanduser()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    return checkpoint_path
+
+
+def _infer_dataset_stats_path(cfg: DictConfig, checkpoint_path: Path) -> Optional[str]:
+    explicit = cfg.data.test.get("pretrained_norm_stats", None)
+    if explicit not in (None, "", "null"):
+        return str(explicit)
+
+    train_stats = cfg.data.train.get("pretrained_norm_stats", None)
+    if train_stats not in (None, "", "null"):
+        return str(train_stats)
+
+    for parent in [checkpoint_path.parent, *checkpoint_path.parents]:
+        candidate = parent / "dataset_stats.json"
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _write_rows_csv(rows: list[dict[str, Any]], csv_path: Path) -> str:
+    preferred = [
+        "idx",
+        "token",
+        "log_name",
+        "traj_l1",
+        "ade",
+        "fde",
+        "ade_2s",
+        "fde_2s",
+        "heading_mae",
+        "score",
+    ]
+    keys = set()
+    for row in rows:
+        keys.update(row.keys())
+    fieldnames = []
+    for key in preferred:
+        if key in keys:
+            fieldnames.append(key)
+            keys.remove(key)
+    fieldnames.extend(sorted(keys))
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return str(csv_path)
+
+
+def _append_average_row(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+    numeric_keys = sorted({
+        key
+        for row in rows
+        for key, value in row.items()
+        if isinstance(value, (int, float)) and key != "idx"
+    })
+    average = {"idx": -1, "token": "average", "log_name": ""}
+    for key in numeric_keys:
+        values = [float(row[key]) for row in rows if key in row and isinstance(row[key], (int, float))]
+        if values:
+            average[key] = float(np.mean(values))
+    return [*rows, average]
+
+
+def _create_pdm_objects(metric_cache_path: Optional[str]):
+    if metric_cache_path in (None, "", "null"):
+        raise ValueError("NavSIM test evaluation requires `data.test.metric_cache_path` for PDM metrics.")
+    metric_cache_root = Path(str(metric_cache_path)).expanduser()
+    if not metric_cache_root.exists():
+        raise FileNotFoundError(f"Metric cache not found: {metric_cache_root}")
+
+    from navsim.common.dataloader import MetricCacheLoader
+    from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer
+    from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
+    from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
+
+    sampling = TrajectorySampling(time_horizon=4, interval_length=0.5)
+    return {
+        "loader": MetricCacheLoader(metric_cache_root),
+        "simulator": PDMSimulator(sampling),
+        "scorer": PDMScorer(sampling),
+        "sampling": sampling,
+    }
+
+
+def _compute_pdm_metrics(pdm_objects: Optional[dict[str, Any]], pred_trajectory: torch.Tensor, token: str) -> dict[str, float]:
+    if pdm_objects is None:
+        return {}
+    loader = pdm_objects["loader"]
+    if token not in loader.tokens:
+        return {}
+
+    from navsim.common.dataclasses import Trajectory
+    from navsim.evaluate.pdm_score import pdm_score
+
+    result = pdm_score(
+        metric_cache=loader.get_from_token(token),
+        model_trajectory=Trajectory(pred_trajectory.detach().cpu().numpy().astype(np.float32)),
+        future_sampling=pdm_objects["sampling"],
+        simulator=pdm_objects["simulator"],
+        scorer=pdm_objects["scorer"],
+    )
+    return {key: float(value) for key, value in asdict(result).items()}
+
+
+@torch.no_grad()
+def run_navsim_evaluation(cfg: DictConfig) -> dict[str, Any]:
+    setup_logging()
+    output_dir = Path(str(cfg.output_dir)).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    misc.register_work_dir(str(output_dir))
+    OmegaConf.save(config=cfg, f=output_dir / "eval_config.yaml")
+
+    checkpoint_path = _resolve_checkpoint_path(cfg)
+    stats_path = _infer_dataset_stats_path(cfg, checkpoint_path)
+    if stats_path is None:
+        raise ValueError(
+            "Could not infer dataset_stats.json. Pass `data.test.pretrained_norm_stats=/path/to/dataset_stats.json`."
+        )
+
+    mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
+    model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
+    device = str(cfg.get("eval_device", None) or _resolve_train_device())
+    logger.info("Loading model on %s from %s", device, checkpoint_path)
+    model = instantiate(cfg.model, model_dtype=model_dtype, device=device)
+    model.load_checkpoint(str(checkpoint_path), optimizer=None)
+    model.eval()
+
+    logger.info("Building NavSIM test dataset with pretrained_norm_stats=%s", stats_path)
+    test_dataset = instantiate(cfg.data.test, pretrained_norm_stats=stats_path)
+    pdm_objects = _create_pdm_objects(test_dataset.metric_cache_path)
+
+    rows: list[dict[str, Any]] = []
+    predictions = {}
+    for idx in tqdm(range(len(test_dataset)), desc="Evaluate NavSIM test"):
+        raw_sample = test_dataset[idx]
+        sample = Wan22Trainer._to_batched_eval_sample(raw_sample)
+        video0 = sample["video"][0]
+        action = sample["action"][0] if sample["action"] is not None else None
+        proprio = sample["proprio"][0, 0] if sample["proprio"] is not None else None
+        input_image = video0[:, 0].unsqueeze(0)
+
+        pred = model.infer_action(
+            prompt=None,
+            input_image=input_image,
+            action_horizon=sample["action_horizon"],
+            proprio=proprio,
+            context=sample["context"][0] if sample["context"] is not None else None,
+            context_mask=sample["context_mask"][0] if sample["context_mask"] is not None else None,
+            num_inference_steps=int(cfg.eval_num_inference_steps),
+            seed=42,
+            rand_device="cpu",
+            tiled=False,
+        )
+        pred_action_denorm = test_dataset.denormalize_action(pred["action"])
+        token = raw_sample.get("token", str(idx))
+        row = {
+            "idx": int(idx),
+            "token": token,
+            "log_name": raw_sample.get("log_name", ""),
+        }
+        if action is not None:
+            gt_action_denorm = test_dataset.denormalize_action(action.detach().cpu())
+            row.update(Wan22Trainer._navsim_trajectory_metrics(pred_action_denorm, gt_action_denorm))
+        row.update(_compute_pdm_metrics(pdm_objects, pred_action_denorm, token))
+        rows.append(row)
+
+        from navsim.common.dataclasses import Trajectory
+
+        predictions[token] = Trajectory(pred_action_denorm.detach().cpu().numpy().astype(np.float32))
+
+    rows = sorted(rows, key=lambda row: int(row.get("idx", 0)))
+    rows_with_average = _append_average_row(rows)
+    csv_path = _write_rows_csv(rows_with_average, output_dir / "navsim_test_metrics.csv")
+    submission_path = output_dir / "submission.pkl"
+    with open(submission_path, "wb") as f:
+        pickle.dump(
+            {
+                "team_name": "FastWAM-NavSIM",
+                "authors": "",
+                "email": "",
+                "institution": "",
+                "country / region": "",
+                "predictions": [predictions],
+            },
+            f,
+        )
+    logger.info("Saved NavSIM test metrics to %s", csv_path)
+    logger.info("Saved NavSIM submission pickle to %s", submission_path)
+    return {"csv_path": csv_path, "submission_path": str(submission_path), "num_samples": len(rows)}
+
+
+@hydra.main(config_path="../configs", config_name="train", version_base="1.3")
+def main(cfg: DictConfig) -> None:
+    run_navsim_evaluation(cfg)
+
+
+if __name__ == "__main__":
+    main()

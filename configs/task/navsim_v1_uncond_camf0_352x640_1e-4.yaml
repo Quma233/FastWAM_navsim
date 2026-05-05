@@ -7,13 +7,32 @@ defaults:
 
 # dataloading: full NavSIM training defaults for H200-class GPUs while leaving
 # optimizer/model/loss defaults inherited from FastWAM base configs.
-batch_size: 2
-num_workers: 8
+batch_size: 16
+num_workers: 16
 
-# Full validation is expensive; keep complete-val semantics but reduce frequency.
-save_every: 1000
-eval_every: 1000
+model:
+  mot_checkpoint_mixed_attn: false
+
+# scheduler
+num_epochs: 50
+# save_every: 10000
+# eval_every: 10000
+save_every: 1774
+eval_every: 1774
 
 # NavSIM validation evaluates the full validation split by default.
 eval_full_dataset: true
+eval_visualization:
+  enabled: true
+  num_samples: 32
+  world_model: true
+  trajectory: true
 optimizer_impl: deepspeed_fused_adam
+weight_decay: 1e-2
+
+wandb:
+  enabled: true
+  workspace: null
+  project: fastwam_navsim
+  group: navsim_sft_v1
+  mode: offline

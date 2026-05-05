@@ -18,6 +18,10 @@ from torch.utils.data import DataLoader
 
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
+from .utils.navsim_visualization import (
+    save_camera_trajectory_overlay,
+    save_world_model_future_sheet,
+)
 from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
@@ -468,13 +472,42 @@ class Wan22Trainer:
             return rows
         return local_rows
 
-    def _write_navsim_eval_csv(self, rows: list[dict]) -> str:
-        csv_path = os.path.join(self.eval_dir, f"navsim_step_{self.global_step:06d}.csv")
-        fieldnames = []
-        preferred = ["idx", "token", "log_name", "val_loss", "traj_l1", "ade", "fde", "ade_2s", "fde_2s", "heading_mae"]
+    def _navsim_eval_visualization_cfg(self) -> dict:
+        cfg = self.cfg.get("eval_visualization", None)
+        if cfg is None:
+            return {
+                "enabled": False,
+                "num_samples": 0,
+                "world_model": True,
+                "trajectory": True,
+            }
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "num_samples": int(cfg.get("num_samples", 32)),
+            "world_model": bool(cfg.get("world_model", True)),
+            "trajectory": bool(cfg.get("trajectory", True)),
+        }
+
+    @staticmethod
+    def _select_evenly_spaced_indices(dataset_len: int, num_samples: int) -> set[int]:
+        dataset_len = int(dataset_len)
+        num_samples = min(max(int(num_samples), 0), dataset_len)
+        if num_samples <= 0:
+            return set()
+        if num_samples >= dataset_len:
+            return set(range(dataset_len))
+        indices = np.linspace(0, dataset_len - 1, num=num_samples, dtype=np.int64).tolist()
+        return {int(idx) for idx in indices}
+
+    @staticmethod
+    def _safe_token_for_filename(token: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(token))
+
+    def _write_rows_csv(self, rows: list[dict], csv_path: str, preferred: list[str]) -> str:
         keys = set()
         for row in rows:
             keys.update(row.keys())
+        fieldnames = []
         for key in preferred:
             if key in keys:
                 fieldnames.append(key)
@@ -485,6 +518,112 @@ class Wan22Trainer:
             writer.writeheader()
             writer.writerows(rows)
         return csv_path
+
+    def _write_navsim_eval_csv(self, rows: list[dict]) -> str:
+        csv_path = os.path.join(self.eval_dir, f"navsim_step_{self.global_step:06d}.csv")
+        preferred = [
+            "idx",
+            "token",
+            "log_name",
+            "val_loss",
+            "traj_l1",
+            "ade",
+            "fde",
+            "ade_2s",
+            "fde_2s",
+            "heading_mae",
+            "pdm_score",
+        ]
+        return self._write_rows_csv(rows, csv_path, preferred)
+
+    def _write_navsim_visualization_csv(self, rows: list[dict], vis_dir: str) -> str:
+        csv_path = os.path.join(vis_dir, "index.csv")
+        preferred = [
+            "idx",
+            "token",
+            "log_name",
+            "psnr_rg",
+            "ssim_rg",
+            "world_model_path",
+            "trajectory_path",
+        ]
+        return self._write_rows_csv(rows, csv_path, preferred)
+
+    def _save_navsim_eval_visualization(
+        self,
+        *,
+        idx: int,
+        raw_sample: dict,
+        sample: dict,
+        pred_action_denorm: torch.Tensor,
+        gt_action_denorm: torch.Tensor,
+        model,
+        vis_cfg: dict,
+    ) -> dict:
+        token = raw_sample.get("token", str(idx))
+        safe_token = self._safe_token_for_filename(token)
+        vis_dir = os.path.join(self.eval_dir, "vis", f"step_{self.global_step:06d}")
+        row = {
+            "idx": int(idx),
+            "token": token,
+            "log_name": raw_sample.get("log_name", ""),
+        }
+
+        video0 = sample["video"][0]
+        action = sample["action"][0] if sample["action"] is not None else None
+        proprio = sample["proprio"][0, 0] if sample["proprio"] is not None else None
+        input_image = video0[:, 0].unsqueeze(0)
+        _, num_frames, _, _ = video0.shape
+
+        if bool(vis_cfg.get("world_model", True)):
+            infer_kwargs = {
+                "prompt": None,
+                "input_image": input_image,
+                "num_frames": int(num_frames),
+                "action": action,
+                "action_horizon": sample["action_horizon"],
+                "proprio": proprio,
+                "context": sample["context"][0] if sample["context"] is not None else None,
+                "context_mask": sample["context_mask"][0] if sample["context_mask"] is not None else None,
+                "text_cfg_scale": 1.0,
+                "action_cfg_scale": 1.0,
+                "num_inference_steps": self.eval_num_inference_steps,
+                "seed": 42,
+                "rand_device": "cpu",
+                "tiled": False,
+            }
+            pred = model.infer(**infer_kwargs)
+            pred_video_tensor = pil_frames_to_video_tensor(pred["video"])
+            gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
+            if pred_video_tensor.shape != gt_video_tensor.shape:
+                raise ValueError(
+                    "NavSIM visualization prediction/GT shape mismatch: "
+                    f"pred={tuple(pred_video_tensor.shape)} gt={tuple(gt_video_tensor.shape)}"
+                )
+
+            row["psnr_rg"] = float(video_psnr(pred=pred_video_tensor[:, 1:], target=gt_video_tensor[:, 1:]))
+            row["ssim_rg"] = float(video_ssim(pred=pred_video_tensor[:, 1:], target=gt_video_tensor[:, 1:]))
+            world_path = os.path.join(vis_dir, "world_model", f"{idx:06d}_{safe_token}.png")
+            row["world_model_path"] = save_world_model_future_sheet(
+                pred_video=pred_video_tensor,
+                gt_video=gt_video_tensor,
+                output_path=world_path,
+            )
+
+        if bool(vis_cfg.get("trajectory", True)):
+            if not hasattr(self.val_dataset, "get_visualization_data"):
+                raise TypeError("NavSIM trajectory visualization requires dataset.get_visualization_data().")
+            visualization_data = self.val_dataset.get_visualization_data(idx)
+            trajectory_path = os.path.join(vis_dir, "trajectory", f"{idx:06d}_{safe_token}.png")
+            row["trajectory_path"] = save_camera_trajectory_overlay(
+                image=visualization_data["image"],
+                camera=visualization_data["camera"],
+                pred_trajectory=pred_action_denorm,
+                gt_trajectory=gt_action_denorm,
+                output_path=trajectory_path,
+            )
+
+        return row
 
     @torch.no_grad()
     def evaluate_full_dataset(self):
@@ -498,6 +637,13 @@ class Wan22Trainer:
         model.eval()
 
         local_rows: list[dict] = []
+        local_vis_rows: list[dict] = []
+        vis_cfg = self._navsim_eval_visualization_cfg()
+        vis_indices = (
+            self._select_evenly_spaced_indices(len(self.val_dataset), int(vis_cfg["num_samples"]))
+            if bool(vis_cfg["enabled"])
+            else set()
+        )
         indices = range(self.accelerator.process_index, len(self.val_dataset), self.accelerator.num_processes)
         for idx in indices:
             raw_sample = self.val_dataset[idx]
@@ -546,11 +692,24 @@ class Wan22Trainer:
                 if pdm_metrics is not None:
                     row.update(pdm_metrics)
             local_rows.append(row)
+            if idx in vis_indices:
+                local_vis_rows.append(
+                    self._save_navsim_eval_visualization(
+                        idx=idx,
+                        raw_sample=raw_sample,
+                        sample=sample,
+                        pred_action_denorm=pred_action_denorm,
+                        gt_action_denorm=gt_action_denorm,
+                        model=model,
+                        vis_cfg=vis_cfg,
+                    )
+                )
 
         if was_dit_training:
             self._set_dit_only_train_mode()
 
         all_rows = self._gather_object_rows(local_rows)
+        all_vis_rows = self._gather_object_rows(local_vis_rows)
         if not self.accelerator.is_main_process:
             return None
         if not all_rows:
@@ -573,6 +732,21 @@ class Wan22Trainer:
             values = [float(row[key]) for row in all_rows if key in row and isinstance(row[key], (int, float))]
             if values:
                 result[key] = float(np.mean(values))
+        if all_vis_rows:
+            all_vis_rows = sorted(all_vis_rows, key=lambda row: int(row.get("idx", 0)))
+            vis_dir = os.path.join(self.eval_dir, "vis", f"step_{self.global_step:06d}")
+            vis_csv_path = self._write_navsim_visualization_csv(all_vis_rows, vis_dir)
+            result["visualization_csv_path"] = vis_csv_path
+            result["image_num_samples"] = int(len(all_vis_rows))
+            for key in ("psnr_rg", "ssim_rg"):
+                values = [
+                    float(row[key])
+                    for row in all_vis_rows
+                    if key in row and isinstance(row[key], (int, float))
+                ]
+                if values:
+                    result[key] = float(np.mean(values))
+            logger.info("Saved NAVSIM validation visualizations to %s", vis_dir)
         logger.info("Saved NAVSIM full validation CSV to %s", csv_path)
         return result
 
@@ -976,8 +1150,16 @@ class Wan22Trainer:
                                 )
                                 if "pdm_score" in metrics:
                                     description += " pdm_score=%.4f" % metrics["pdm_score"]
+                                if "psnr_rg" in metrics and "ssim_rg" in metrics:
+                                    description += " image_samples=%d psnr_rg=%.4f ssim_rg=%.4f" % (
+                                        int(metrics.get("image_num_samples", 0)),
+                                        metrics["psnr_rg"],
+                                        metrics["ssim_rg"],
+                                    )
                                 if "csv_path" in metrics:
                                     description += " csv=%s" % metrics["csv_path"]
+                                if "visualization_csv_path" in metrics:
+                                    description += " vis=%s" % metrics["visualization_csv_path"]
                                 logger.info(description)
                                 eval_payload = {}
                                 for key, value in metrics.items():

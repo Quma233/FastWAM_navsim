@@ -2,10 +2,10 @@ train:
   _target_: fastwam.datasets.navsim_v1.NavsimV1FastWAMDataset
   navsim_log_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/navsim_logs/trainval
   sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/sensor_blobs/trainval
-  metric_cache_path: ${oc.env:NAVSIM_EXP_ROOT,/path/to/navsim_dataset/exp}/metric_cache
+  metric_cache_path: ${oc.env:NAVSIM_EXP_ROOT,/path/to/navsim_dataset/exp}/metric_cache_v1.1.0_navtrain
   split: train
   split_mode: official
-  navsim_split_name: navtrain
+  navsim_split_name: navtrain  # all_scenes
   split_config_root: ./third_party/navsim/navsim/planning/script/config
   log_split_file: default_train_val_test_log_split.yaml
   num_future_frames: 8
@@ -66,7 +66,7 @@ test:
   _target_: fastwam.datasets.navsim_v1.NavsimV1FastWAMDataset
   navsim_log_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/navsim_logs/test
   sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/sensor_blobs/test
-  metric_cache_path: ${data.train.metric_cache_path}
+  metric_cache_path: ${oc.env:NAVSIM_EXP_ROOT,/path/to/navsim_dataset/exp}/metric_cache_v1.1.0_navtest
   split: test
   split_mode: ${data.train.split_mode}
   navsim_split_name: navtest

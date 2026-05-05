@@ -387,28 +387,72 @@ class NavsimV1FastWAMDataset(Dataset):
             "log_name": sample_info["log_name"],
         }
 
-    def _load_video_tensor(self, window: list[dict[str, Any]]) -> torch.Tensor:
+    def _load_camera_from_frame(self, frame: dict[str, Any]):
         from navsim.common.dataclasses import Cameras
 
+        cameras = Cameras.from_camera_dict(
+            sensor_blobs_path=self.sensor_blobs_path,
+            camera_dict=frame["cams"],
+            sensor_names=[self.camera_attr],
+        )
+        camera = getattr(cameras, self.camera_attr)
+        if camera.image is None:
+            raise FileNotFoundError(f"Missing {self.camera} image for token={frame.get('token')}")
+        return camera
+
+    def _preprocess_camera_image(self, image: np.ndarray) -> np.ndarray:
+        # Drive-JEPA NAVSIM v1 front-camera preprocessing: crop vertical borders, resize.
+        image = image[28:-28]
+        image = cv2.resize(
+            image,
+            (self.video_size[1], self.video_size[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        return np.ascontiguousarray(image)
+
+    def _processed_camera_intrinsics(
+        self,
+        intrinsics: np.ndarray,
+        raw_image_shape: tuple[int, int],
+    ) -> np.ndarray:
+        raw_height, raw_width = int(raw_image_shape[0]), int(raw_image_shape[1])
+        cropped_height = raw_height - 56
+        if cropped_height <= 0:
+            raise ValueError(f"Unexpected NAVSIM camera image height: {raw_height}")
+        scale_x = float(self.video_size[1]) / float(raw_width)
+        scale_y = float(self.video_size[0]) / float(cropped_height)
+        adjusted = np.asarray(intrinsics, dtype=np.float32).copy()
+        adjusted[0, 0] *= scale_x
+        adjusted[0, 2] *= scale_x
+        adjusted[1, 1] *= scale_y
+        adjusted[1, 2] = (adjusted[1, 2] - 28.0) * scale_y
+        return adjusted
+
+    def get_visualization_data(self, idx: int) -> dict[str, Any]:
+        sample_info = self.samples[int(idx)]
+        window = self._load_window(sample_info)
+        camera = self._load_camera_from_frame(window[0])
+        return {
+            "token": sample_info["token"],
+            "log_name": sample_info["log_name"],
+            "image": self._preprocess_camera_image(camera.image),
+            "camera": {
+                "sensor2lidar_rotation": np.asarray(camera.sensor2lidar_rotation, dtype=np.float32),
+                "sensor2lidar_translation": np.asarray(camera.sensor2lidar_translation, dtype=np.float32),
+                "intrinsics": self._processed_camera_intrinsics(
+                    np.asarray(camera.intrinsics, dtype=np.float32),
+                    raw_image_shape=camera.image.shape[:2],
+                ),
+            },
+        }
+
+    def _load_video_tensor(self, window: list[dict[str, Any]]) -> torch.Tensor:
         frames = []
         for frame_idx, frame in enumerate(window):
-            cameras = Cameras.from_camera_dict(
-                sensor_blobs_path=self.sensor_blobs_path,
-                camera_dict=frame["cams"],
-                sensor_names=self._sensor_config.get_sensors_at_iteration(frame_idx),
-            )
-            camera = getattr(cameras, self.camera_attr)
-            if camera.image is None:
-                raise FileNotFoundError(f"Missing {self.camera} image for token={frame.get('token')}")
-            image = camera.image
-            # Drive-JEPA NAVSIM v1 front-camera preprocessing: crop vertical borders, resize.
-            image = image[28:-28]
-            image = cv2.resize(
-                image,
-                (self.video_size[1], self.video_size[0]),
-                interpolation=cv2.INTER_LINEAR,
-            )
-            frames.append(torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1))
+            del frame_idx
+            camera = self._load_camera_from_frame(frame)
+            image = self._preprocess_camera_image(camera.image)
+            frames.append(torch.from_numpy(image).permute(2, 0, 1))
         return torch.stack(frames, dim=0).to(torch.uint8)
 
     @staticmethod
@@ -596,9 +640,7 @@ class NavsimV1FastWAMDataset(Dataset):
                 simulator=simulator,
                 scorer=scorer,
             )
-            raw_metrics = {key: float(value) for key, value in asdict(result).items()}
-            prefixed_metrics = {f"pdm_{key}": value for key, value in raw_metrics.items()}
-            return {**raw_metrics, **prefixed_metrics}
+            return {f"pdm_{key}": float(value) for key, value in asdict(result).items()}
         except Exception as exc:
             logger.warning("PDM metric failed for token=%s: %s", token, exc)
             return None
