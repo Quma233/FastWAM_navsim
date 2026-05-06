@@ -174,6 +174,13 @@ runs/<task>/<RUN_ID>/eval/navsim_step_*.csv
 runs/<task>/<RUN_ID>/eval/vis/step_<STEP>/index.csv
 runs/<task>/<RUN_ID>/eval/vis/step_<STEP>/world_model/*.png
 runs/<task>/<RUN_ID>/eval/vis/step_<STEP>/trajectory/*.png
+runs/<task>/<RUN_ID>/eval/vis/step_<STEP>/bev/*.png
+```
+
+可视化样本现在取 dataset 的前 `num_samples` 个 index：
+
+```text
+idx = 0, 1, ..., num_samples - 1
 ```
 
 `world_model/*.png` 左边是预测 future frame，右边是 GT future frame。
@@ -182,6 +189,12 @@ runs/<task>/<RUN_ID>/eval/vis/step_<STEP>/trajectory/*.png
 
 - 绿色：GT future trajectory
 - 红色：predicted future trajectory
+
+`bev/*.png` 是简单 ego-frame BEV，不画地图和 annotation：
+
+- 绿色：GT future trajectory
+- 红色：predicted future trajectory
+- 黑色框：ego vehicle
 
 `psnr_rg` 和 `ssim_rg` 只在这 32 个可视化样本上计算，不是 whole val 的图像指标。
 
@@ -196,6 +209,17 @@ python scripts/evaluate_navsim.py \
   output_dir=./runs/navsim_v1_uncond_camf0_352x640_1e-4/eval_navtest_step_XXXXXX
 ```
 
+多卡 navtest 用 `torchrun`，每张卡处理一部分 test set，rank 0 负责汇总并保存 CSV/submission/可视化：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 scripts/evaluate_navsim.py \
+  task=navsim_v1_uncond_camf0_352x640_1e-4 \
+  resume=/path/to/run/checkpoints/weights/step_XXXXXX.pt \
+  output_dir=./runs/navsim_v1_uncond_camf0_352x640_1e-4/eval_navtest_step_XXXXXX
+```
+
+多卡评估时不要手动传 `eval_device`，脚本会自动使用 `cuda:<LOCAL_RANK>`。
+
 输出：
 
 ```text
@@ -205,9 +229,21 @@ eval_config.yaml
 vis/index.csv
 vis/world_model/*.png
 vis/trajectory/*.png
+vis/bev/*.png
 ```
 
-当前 task 默认通过 `eval_visualization` 开启 32 个样本的 test 可视化。test 脚本会默认沿用这组配置；如果需要单独覆盖，可以加 `test_visualization`：
+`navsim_test_metrics.csv` 现在是更容易读的格式：
+
+```text
+idx,token,log_name,metrics
+0,<token>,<log>,"ade: ...; fde: ...; score: ..."
+1,<token>,<log>,"ade: ...; fde: ...; score: ..."
+-1,average,,"ade: ...; fde: ...; score: ..."
+```
+
+终端只额外输出最后的 average metrics，不逐 sample 打印。
+
+当前 task 默认通过 `eval_visualization` 开启 32 个样本的 test 可视化。这里取的是 test dataset 的前 32 个样本。test 脚本会默认沿用这组配置；如果需要单独覆盖，可以加 `test_visualization`：
 
 ```bash
 python scripts/evaluate_navsim.py \
@@ -217,7 +253,18 @@ python scripts/evaluate_navsim.py \
   +test_visualization.enabled=true \
   +test_visualization.num_samples=32 \
   +test_visualization.world_model=true \
-  +test_visualization.trajectory=true
+  +test_visualization.trajectory=true \
+  +test_visualization.bev=true
+```
+
+快速只看前 4 个 test sample：
+
+```bash
+python scripts/evaluate_navsim.py \
+  task=navsim_v1_uncond_camf0_352x640_1e-4 \
+  resume=/path/to/run/checkpoints/weights/step_XXXXXX.pt \
+  output_dir=./runs/eval_navtest_vis4 \
+  +test_visualization.num_samples=4
 ```
 
 如果只想跑 metrics，不保存图：
@@ -228,6 +275,16 @@ python scripts/evaluate_navsim.py \
   resume=/path/to/run/checkpoints/weights/step_XXXXXX.pt \
   output_dir=./runs/eval_navtest_step_XXXXXX \
   eval_visualization.enabled=false
+```
+
+如果只想关掉 BEV：
+
+```bash
+python scripts/evaluate_navsim.py \
+  task=navsim_v1_uncond_camf0_352x640_1e-4 \
+  resume=/path/to/run/checkpoints/weights/step_XXXXXX.pt \
+  output_dir=./runs/eval_navtest_step_XXXXXX \
+  +test_visualization.bev=false
 ```
 
 `scripts/evaluate_navsim.py` 需要 `data.test.metric_cache_path` 有效，默认是：

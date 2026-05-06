@@ -330,12 +330,19 @@ eval_visualization:
   trajectory: true
 ```
 
+The selected visualization samples are the first `num_samples` dataset indices:
+
+```text
+idx = 0, 1, ..., num_samples - 1
+```
+
 Outputs:
 
 ```text
 runs/<task>/<RUN_ID>/eval/vis/step_<STEP>/index.csv
 runs/<task>/<RUN_ID>/eval/vis/step_<STEP>/world_model/*.png
 runs/<task>/<RUN_ID>/eval/vis/step_<STEP>/trajectory/*.png
+runs/<task>/<RUN_ID>/eval/vis/step_<STEP>/bev/*.png
 ```
 
 World-model images show predicted future frames on the left and GT future frames on the right.
@@ -344,6 +351,12 @@ Trajectory images show the current `CAM_F0` frame with:
 
 - green: GT future trajectory
 - red: predicted future trajectory
+
+BEV images show a simple ego-frame top-down view without map or annotations:
+
+- green: GT future trajectory
+- red: predicted future trajectory
+- black box: ego vehicle
 
 `psnr_rg` and `ssim_rg` are computed only on these selected visualization samples, not over the whole validation set. They are logged as image-quality diagnostics for the world-model output.
 
@@ -358,14 +371,26 @@ python scripts/evaluate_navsim.py \
   output_dir=./runs/navsim_v1_uncond_camf0_352x640_1e-4/eval_navtest_step_XXXXXX
 ```
 
+Multi-GPU evaluation is supported with `torchrun`; each rank evaluates a shard of the test set and rank 0 writes the merged CSV/submission/visualizations:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 scripts/evaluate_navsim.py \
+  task=navsim_v1_uncond_camf0_352x640_1e-4 \
+  resume=/path/to/run/checkpoints/weights/step_XXXXXX.pt \
+  output_dir=./runs/navsim_v1_uncond_camf0_352x640_1e-4/eval_navtest_step_XXXXXX
+```
+
+Do not pass `eval_device` for multi-GPU evaluation; the script assigns `cuda:<LOCAL_RANK>` automatically.
+
 The script:
 
 - builds `cfg.data.test`
 - loads `dataset_stats.json` automatically from the checkpoint run directory when possible
 - runs `model.infer_action`
-- writes per-token metrics and an average row
+- writes per-token metrics plus an average row
 - writes a NAVSIM-style submission pickle
 - saves test visualizations when `eval_visualization.enabled=true`, or when `test_visualization` is provided
+- prints the final average metrics to the terminal
 
 Outputs:
 
@@ -376,9 +401,21 @@ eval_config.yaml
 vis/index.csv
 vis/world_model/*.png
 vis/trajectory/*.png
+vis/bev/*.png
 ```
 
-By default, the current task config enables 32 visualization samples through `eval_visualization`. Test visualization uses the same fields unless you add a test-only override:
+`navsim_test_metrics.csv` uses a compact readable format:
+
+```text
+idx,token,log_name,metrics
+0,<token>,<log>,"ade: ...; fde: ...; score: ..."
+1,<token>,<log>,"ade: ...; fde: ...; score: ..."
+-1,average,,"ade: ...; fde: ...; score: ..."
+```
+
+The terminal only prints the final average metrics, not one line per sample.
+
+By default, the current task config enables 32 visualization samples through `eval_visualization`. These are the first 32 test samples. Test visualization uses the same fields unless you add a test-only override:
 
 ```bash
 python scripts/evaluate_navsim.py \
@@ -388,7 +425,18 @@ python scripts/evaluate_navsim.py \
   +test_visualization.enabled=true \
   +test_visualization.num_samples=32 \
   +test_visualization.world_model=true \
-  +test_visualization.trajectory=true
+  +test_visualization.trajectory=true \
+  +test_visualization.bev=true
+```
+
+To quickly visualize only the first 4 test samples:
+
+```bash
+python scripts/evaluate_navsim.py \
+  task=navsim_v1_uncond_camf0_352x640_1e-4 \
+  resume=/path/to/run/checkpoints/weights/step_XXXXXX.pt \
+  output_dir=./runs/eval_navtest_vis4 \
+  +test_visualization.num_samples=4
 ```
 
 To disable visualization for a metrics-only test run:
@@ -399,6 +447,16 @@ python scripts/evaluate_navsim.py \
   resume=/path/to/run/checkpoints/weights/step_XXXXXX.pt \
   output_dir=./runs/eval_navtest_step_XXXXXX \
   eval_visualization.enabled=false
+```
+
+To disable only BEV visualization:
+
+```bash
+python scripts/evaluate_navsim.py \
+  task=navsim_v1_uncond_camf0_352x640_1e-4 \
+  resume=/path/to/run/checkpoints/weights/step_XXXXXX.pt \
+  output_dir=./runs/eval_navtest_step_XXXXXX \
+  +test_visualization.bev=false
 ```
 
 Test evaluation requires `data.test.metric_cache_path`. By default it is:
