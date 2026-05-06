@@ -352,7 +352,7 @@ def _create_pdm_objects(metric_cache_path: Optional[str]):
     from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
     from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
-    sampling = TrajectorySampling(time_horizon=4, interval_length=0.5)
+    sampling = TrajectorySampling(num_poses=40, interval_length=0.1)
     return {
         "loader": MetricCacheLoader(metric_cache_root),
         "simulator": PDMSimulator(sampling),

@@ -630,7 +630,7 @@ class NavsimV1FastWAMDataset(Dataset):
             from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
             metric_cache = loader.get_from_token(token)
-            sampling = TrajectorySampling(time_horizon=4, interval_length=NAVSIM_INTERVAL_LENGTH)
+            sampling = TrajectorySampling(num_poses=40, interval_length=0.1)
             simulator = PDMSimulator(sampling)
             scorer = PDMScorer(sampling)
             result = pdm_score(
