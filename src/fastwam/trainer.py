@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
 from .utils.navsim_visualization import (
+    save_bev_trajectory_overlay,
     save_camera_trajectory_overlay,
     save_world_model_future_sheet,
 )
@@ -480,24 +481,23 @@ class Wan22Trainer:
                 "num_samples": 0,
                 "world_model": True,
                 "trajectory": True,
+                "bev": True,
             }
         return {
             "enabled": bool(cfg.get("enabled", False)),
             "num_samples": int(cfg.get("num_samples", 32)),
             "world_model": bool(cfg.get("world_model", True)),
             "trajectory": bool(cfg.get("trajectory", True)),
+            "bev": bool(cfg.get("bev", True)),
         }
 
     @staticmethod
-    def _select_evenly_spaced_indices(dataset_len: int, num_samples: int) -> set[int]:
+    def _select_first_indices(dataset_len: int, num_samples: int) -> set[int]:
         dataset_len = int(dataset_len)
         num_samples = min(max(int(num_samples), 0), dataset_len)
         if num_samples <= 0:
             return set()
-        if num_samples >= dataset_len:
-            return set(range(dataset_len))
-        indices = np.linspace(0, dataset_len - 1, num=num_samples, dtype=np.int64).tolist()
-        return {int(idx) for idx in indices}
+        return set(range(num_samples))
 
     @staticmethod
     def _safe_token_for_filename(token: str) -> str:
@@ -537,6 +537,7 @@ class Wan22Trainer:
         return self._write_rows_csv(rows, csv_path, preferred)
 
     def _write_navsim_visualization_csv(self, rows: list[dict], vis_dir: str) -> str:
+        ensure_dir(vis_dir)
         csv_path = os.path.join(vis_dir, "index.csv")
         preferred = [
             "idx",
@@ -546,6 +547,7 @@ class Wan22Trainer:
             "ssim_rg",
             "world_model_path",
             "trajectory_path",
+            "bev_path",
         ]
         return self._write_rows_csv(rows, csv_path, preferred)
 
@@ -623,6 +625,14 @@ class Wan22Trainer:
                 output_path=trajectory_path,
             )
 
+        if bool(vis_cfg.get("bev", True)):
+            bev_path = os.path.join(vis_dir, "bev", f"{idx:06d}_{safe_token}.png")
+            row["bev_path"] = save_bev_trajectory_overlay(
+                pred_trajectory=pred_action_denorm,
+                gt_trajectory=gt_action_denorm,
+                output_path=bev_path,
+            )
+
         return row
 
     @torch.no_grad()
@@ -640,7 +650,7 @@ class Wan22Trainer:
         local_vis_rows: list[dict] = []
         vis_cfg = self._navsim_eval_visualization_cfg()
         vis_indices = (
-            self._select_evenly_spaced_indices(len(self.val_dataset), int(vis_cfg["num_samples"]))
+            self._select_first_indices(len(self.val_dataset), int(vis_cfg["num_samples"]))
             if bool(vis_cfg["enabled"])
             else set()
         )

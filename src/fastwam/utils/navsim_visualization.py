@@ -141,3 +141,100 @@ def save_camera_trajectory_overlay(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output_path)
     return str(output_path)
+
+
+def _trajectory_xy(trajectory: torch.Tensor | np.ndarray) -> np.ndarray:
+    trajectory = trajectory.detach().cpu().float().numpy() if isinstance(trajectory, torch.Tensor) else np.asarray(trajectory)
+    if trajectory.ndim != 2 or trajectory.shape[1] < 2:
+        raise ValueError(f"Expected trajectory [T,>=2], got {trajectory.shape}")
+    return trajectory[:, :2].astype(np.float32)
+
+
+def save_bev_trajectory_overlay(
+    pred_trajectory: torch.Tensor | np.ndarray,
+    gt_trajectory: torch.Tensor | np.ndarray,
+    output_path: str | Path,
+    *,
+    canvas_size: int = 640,
+) -> str:
+    """Draw a simple ego-frame BEV with predicted and GT future trajectories."""
+    pred_xy = _trajectory_xy(pred_trajectory)
+    gt_xy = _trajectory_xy(gt_trajectory)
+    points = np.concatenate([np.zeros((1, 2), dtype=np.float32), pred_xy, gt_xy], axis=0)
+
+    x_min = min(-5.0, float(np.nanmin(points[:, 0])) - 5.0)
+    x_max = max(40.0, float(np.nanmax(points[:, 0])) + 5.0)
+    lateral = max(20.0, float(np.nanmax(np.abs(points[:, 1]))) + 5.0)
+
+    width = int(canvas_size)
+    height = int(canvas_size)
+    margin = 48
+    plot_w = width - 2 * margin
+    plot_h = height - 2 * margin
+    scale_x = plot_h / max(x_max - x_min, 1e-6)
+    scale_y = plot_w / max(2.0 * lateral, 1e-6)
+
+    def to_pixel(xy: np.ndarray) -> list[tuple[int, int]]:
+        pixels = []
+        for x, y in np.asarray(xy, dtype=np.float32):
+            px = margin + (lateral - float(y)) * scale_y
+            py = margin + (x_max - float(x)) * scale_x
+            pixels.append((int(round(px)), int(round(py))))
+        return pixels
+
+    canvas = Image.new("RGB", (width, height), color=(248, 248, 248))
+    draw = ImageDraw.Draw(canvas)
+
+    grid_color = (220, 220, 220)
+    axis_color = (150, 150, 150)
+    text_color = (40, 40, 40)
+    x_tick_start = int(np.floor(x_min / 5.0) * 5)
+    x_tick_end = int(np.ceil(x_max / 5.0) * 5)
+    for x in range(x_tick_start, x_tick_end + 1, 5):
+        y0 = to_pixel(np.array([[x, -lateral]], dtype=np.float32))[0]
+        y1 = to_pixel(np.array([[x, lateral]], dtype=np.float32))[0]
+        draw.line([y0, y1], fill=axis_color if x == 0 else grid_color, width=2 if x == 0 else 1)
+        if x >= 0:
+            label_point = to_pixel(np.array([[x, lateral]], dtype=np.float32))[0]
+            draw.text((label_point[0] + 4, label_point[1] - 8), f"{x}m", fill=text_color)
+
+    y_tick_start = int(np.floor(-lateral / 5.0) * 5)
+    y_tick_end = int(np.ceil(lateral / 5.0) * 5)
+    for y in range(y_tick_start, y_tick_end + 1, 5):
+        p0 = to_pixel(np.array([[x_min, y]], dtype=np.float32))[0]
+        p1 = to_pixel(np.array([[x_max, y]], dtype=np.float32))[0]
+        draw.line([p0, p1], fill=axis_color if y == 0 else grid_color, width=2 if y == 0 else 1)
+
+    def draw_traj(xy: np.ndarray, color: tuple[int, int, int]) -> None:
+        path = to_pixel(np.concatenate([np.zeros((1, 2), dtype=np.float32), xy], axis=0))
+        if len(path) >= 2:
+            draw.line(path, fill=color, width=4)
+        for point in path[1:]:
+            x, y = point
+            draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill=color)
+
+    draw_traj(gt_xy, (40, 180, 80))
+    draw_traj(pred_xy, (230, 70, 70))
+
+    ego_box = np.array(
+        [
+            [-1.5, 1.0],
+            [3.0, 1.0],
+            [3.0, -1.0],
+            [-1.5, -1.0],
+            [-1.5, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    draw.line(to_pixel(ego_box), fill=(30, 30, 30), width=3)
+    origin = to_pixel(np.zeros((1, 2), dtype=np.float32))[0]
+    draw.ellipse((origin[0] - 4, origin[1] - 4, origin[0] + 4, origin[1] + 4), fill=(30, 30, 30))
+    draw.text((14, 12), "BEV ego frame", fill=text_color)
+    draw.text((14, 34), "Green: GT traj", fill=(40, 180, 80))
+    draw.text((14, 54), "Red: Pred traj", fill=(230, 70, 70))
+    draw.text((width - 118, 12), "front", fill=text_color)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path)
+    return str(output_path)
