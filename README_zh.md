@@ -91,6 +91,9 @@ num_workers: 16
 
 model:
   mot_checkpoint_mixed_attn: false
+  loss:
+    lambda_video: 0.1
+    lambda_action: 1.0
 
 num_epochs: 50
 save_every: 1774
@@ -115,7 +118,7 @@ wandb:
 
 `save_every` 和 `eval_every` 是 step 间隔，不是 epoch 数。如果想每个 epoch 保存和评估一次，把它们设成一个 epoch 对应的 optimizer step 数。
 
-learning rate、scheduler、precision、loss weight 等全局默认值仍在 `configs/train.yaml`。
+learning rate、scheduler、precision、gradient clipping 等全局默认值仍在 `configs/train.yaml`。NavSIM task 会覆盖上面列出的字段，包括 video/action loss weight。
 
 ## 训练命令
 
@@ -199,6 +202,32 @@ python scripts/evaluate_navsim.py \
 navsim_test_metrics.csv
 submission.pkl
 eval_config.yaml
+vis/index.csv
+vis/world_model/*.png
+vis/trajectory/*.png
+```
+
+当前 task 默认通过 `eval_visualization` 开启 32 个样本的 test 可视化。test 脚本会默认沿用这组配置；如果需要单独覆盖，可以加 `test_visualization`：
+
+```bash
+python scripts/evaluate_navsim.py \
+  task=navsim_v1_uncond_camf0_352x640_1e-4 \
+  resume=/path/to/run/checkpoints/weights/step_XXXXXX.pt \
+  output_dir=./runs/eval_navtest_step_XXXXXX \
+  +test_visualization.enabled=true \
+  +test_visualization.num_samples=32 \
+  +test_visualization.world_model=true \
+  +test_visualization.trajectory=true
+```
+
+如果只想跑 metrics，不保存图：
+
+```bash
+python scripts/evaluate_navsim.py \
+  task=navsim_v1_uncond_camf0_352x640_1e-4 \
+  resume=/path/to/run/checkpoints/weights/step_XXXXXX.pt \
+  output_dir=./runs/eval_navtest_step_XXXXXX \
+  eval_visualization.enabled=false
 ```
 
 `scripts/evaluate_navsim.py` 需要 `data.test.metric_cache_path` 有效，默认是：

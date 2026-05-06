@@ -1,5 +1,6 @@
 import csv
 import pickle
+import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -20,6 +21,11 @@ from fastwam.trainer import Wan22Trainer
 from fastwam.utils import misc
 from fastwam.utils.config_resolvers import register_default_resolvers
 from fastwam.utils.logging_config import get_logger, setup_logging
+from fastwam.utils.navsim_visualization import (
+    save_camera_trajectory_overlay,
+    save_world_model_future_sheet,
+)
+from fastwam.utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
 logger = get_logger(__name__)
 
@@ -52,19 +58,20 @@ def _infer_dataset_stats_path(cfg: DictConfig, checkpoint_path: Path) -> Optiona
     return None
 
 
-def _write_rows_csv(rows: list[dict[str, Any]], csv_path: Path) -> str:
-    preferred = [
-        "idx",
-        "token",
-        "log_name",
-        "traj_l1",
-        "ade",
-        "fde",
-        "ade_2s",
-        "fde_2s",
-        "heading_mae",
-        "score",
-    ]
+def _write_rows_csv(rows: list[dict[str, Any]], csv_path: Path, preferred: Optional[list[str]] = None) -> str:
+    if preferred is None:
+        preferred = [
+            "idx",
+            "token",
+            "log_name",
+            "traj_l1",
+            "ade",
+            "fde",
+            "ade_2s",
+            "fde_2s",
+            "heading_mae",
+            "score",
+        ]
     keys = set()
     for row in rows:
         keys.update(row.keys())
@@ -96,6 +103,141 @@ def _append_average_row(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if values:
             average[key] = float(np.mean(values))
     return [*rows, average]
+
+
+def _visualization_cfg(cfg: DictConfig) -> dict[str, Any]:
+    base_cfg = cfg.get("eval_visualization", None)
+    override_cfg = cfg.get("test_visualization", None)
+    if base_cfg is None and override_cfg is None:
+        return {
+            "enabled": False,
+            "num_samples": 0,
+            "world_model": True,
+            "trajectory": True,
+        }
+
+    def get_value(key: str, default: Any) -> Any:
+        if override_cfg is not None and key in override_cfg:
+            return override_cfg.get(key)
+        if base_cfg is not None and key in base_cfg:
+            return base_cfg.get(key)
+        return default
+
+    return {
+        "enabled": bool(get_value("enabled", False)),
+        "num_samples": int(get_value("num_samples", 32)),
+        "world_model": bool(get_value("world_model", True)),
+        "trajectory": bool(get_value("trajectory", True)),
+    }
+
+
+def _select_evenly_spaced_indices(dataset_len: int, num_samples: int) -> set[int]:
+    dataset_len = int(dataset_len)
+    num_samples = min(max(int(num_samples), 0), dataset_len)
+    if num_samples <= 0:
+        return set()
+    if num_samples >= dataset_len:
+        return set(range(dataset_len))
+    indices = np.linspace(0, dataset_len - 1, num=num_samples, dtype=np.int64).tolist()
+    return {int(idx) for idx in indices}
+
+
+def _safe_token_for_filename(token: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(token))
+
+
+def _write_visualization_csv(rows: list[dict[str, Any]], vis_dir: Path) -> str:
+    preferred = [
+        "idx",
+        "token",
+        "log_name",
+        "psnr_rg",
+        "ssim_rg",
+        "world_model_path",
+        "trajectory_path",
+    ]
+    return _write_rows_csv(rows, vis_dir / "index.csv", preferred)
+
+
+def _save_navsim_test_visualization(
+    *,
+    idx: int,
+    raw_sample: dict[str, Any],
+    sample: dict[str, Any],
+    pred_action_denorm: torch.Tensor,
+    gt_action_denorm: Optional[torch.Tensor],
+    model,
+    test_dataset,
+    output_dir: Path,
+    vis_cfg: dict[str, Any],
+    num_inference_steps: int,
+) -> dict[str, Any]:
+    token = raw_sample.get("token", str(idx))
+    safe_token = _safe_token_for_filename(token)
+    vis_dir = output_dir / "vis"
+    row: dict[str, Any] = {
+        "idx": int(idx),
+        "token": token,
+        "log_name": raw_sample.get("log_name", ""),
+    }
+
+    video0 = sample["video"][0]
+    action = sample["action"][0] if sample["action"] is not None else None
+    proprio = sample["proprio"][0, 0] if sample["proprio"] is not None else None
+    input_image = video0[:, 0].unsqueeze(0)
+    _, num_frames, _, _ = video0.shape
+
+    if bool(vis_cfg.get("world_model", True)):
+        pred = model.infer(
+            prompt=None,
+            input_image=input_image,
+            num_frames=int(num_frames),
+            action=action,
+            action_horizon=sample["action_horizon"],
+            proprio=proprio,
+            context=sample["context"][0] if sample["context"] is not None else None,
+            context_mask=sample["context_mask"][0] if sample["context_mask"] is not None else None,
+            text_cfg_scale=1.0,
+            action_cfg_scale=1.0,
+            num_inference_steps=int(num_inference_steps),
+            seed=42,
+            rand_device="cpu",
+            tiled=False,
+        )
+        pred_video_tensor = pil_frames_to_video_tensor(pred["video"])
+        gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
+        if pred_video_tensor.shape != gt_video_tensor.shape:
+            raise ValueError(
+                "NavSIM test visualization prediction/GT shape mismatch: "
+                f"pred={tuple(pred_video_tensor.shape)} gt={tuple(gt_video_tensor.shape)}"
+            )
+
+        row["psnr_rg"] = float(video_psnr(pred=pred_video_tensor[:, 1:], target=gt_video_tensor[:, 1:]))
+        row["ssim_rg"] = float(video_ssim(pred=pred_video_tensor[:, 1:], target=gt_video_tensor[:, 1:]))
+        world_path = vis_dir / "world_model" / f"{idx:06d}_{safe_token}.png"
+        row["world_model_path"] = save_world_model_future_sheet(
+            pred_video=pred_video_tensor,
+            gt_video=gt_video_tensor,
+            output_path=world_path,
+        )
+
+    if bool(vis_cfg.get("trajectory", True)):
+        if gt_action_denorm is None:
+            logger.warning("Skipping trajectory visualization for idx=%d token=%s because GT action is unavailable.", idx, token)
+        else:
+            if not hasattr(test_dataset, "get_visualization_data"):
+                raise TypeError("NavSIM trajectory visualization requires dataset.get_visualization_data().")
+            visualization_data = test_dataset.get_visualization_data(idx)
+            trajectory_path = vis_dir / "trajectory" / f"{idx:06d}_{safe_token}.png"
+            row["trajectory_path"] = save_camera_trajectory_overlay(
+                image=visualization_data["image"],
+                camera=visualization_data["camera"],
+                pred_trajectory=pred_action_denorm,
+                gt_trajectory=gt_action_denorm,
+                output_path=trajectory_path,
+            )
+
+    return row
 
 
 def _create_pdm_objects(metric_cache_path: Optional[str]):
@@ -165,8 +307,17 @@ def run_navsim_evaluation(cfg: DictConfig) -> dict[str, Any]:
     logger.info("Building NavSIM test dataset with pretrained_norm_stats=%s", stats_path)
     test_dataset = instantiate(cfg.data.test, pretrained_norm_stats=stats_path)
     pdm_objects = _create_pdm_objects(test_dataset.metric_cache_path)
+    vis_cfg = _visualization_cfg(cfg)
+    vis_indices = (
+        _select_evenly_spaced_indices(len(test_dataset), int(vis_cfg["num_samples"]))
+        if bool(vis_cfg.get("enabled", False))
+        else set()
+    )
+    if vis_indices:
+        logger.info("Saving NavSIM test visualizations for %d samples under %s", len(vis_indices), output_dir / "vis")
 
     rows: list[dict[str, Any]] = []
+    vis_rows: list[dict[str, Any]] = []
     predictions = {}
     for idx in tqdm(range(len(test_dataset)), desc="Evaluate NavSIM test"):
         raw_sample = test_dataset[idx]
@@ -195,11 +346,28 @@ def run_navsim_evaluation(cfg: DictConfig) -> dict[str, Any]:
             "token": token,
             "log_name": raw_sample.get("log_name", ""),
         }
+        gt_action_denorm = None
         if action is not None:
             gt_action_denorm = test_dataset.denormalize_action(action.detach().cpu())
             row.update(Wan22Trainer._navsim_trajectory_metrics(pred_action_denorm, gt_action_denorm))
         row.update(_compute_pdm_metrics(pdm_objects, pred_action_denorm, token))
         rows.append(row)
+
+        if idx in vis_indices:
+            vis_rows.append(
+                _save_navsim_test_visualization(
+                    idx=idx,
+                    raw_sample=raw_sample,
+                    sample=sample,
+                    pred_action_denorm=pred_action_denorm,
+                    gt_action_denorm=gt_action_denorm,
+                    model=model,
+                    test_dataset=test_dataset,
+                    output_dir=output_dir,
+                    vis_cfg=vis_cfg,
+                    num_inference_steps=int(cfg.eval_num_inference_steps),
+                )
+            )
 
         from navsim.common.dataclasses import Trajectory
 
@@ -223,7 +391,14 @@ def run_navsim_evaluation(cfg: DictConfig) -> dict[str, Any]:
         )
     logger.info("Saved NavSIM test metrics to %s", csv_path)
     logger.info("Saved NavSIM submission pickle to %s", submission_path)
-    return {"csv_path": csv_path, "submission_path": str(submission_path), "num_samples": len(rows)}
+    result = {"csv_path": csv_path, "submission_path": str(submission_path), "num_samples": len(rows)}
+    if vis_rows:
+        vis_rows = sorted(vis_rows, key=lambda row: int(row.get("idx", 0)))
+        vis_csv_path = _write_visualization_csv(vis_rows, output_dir / "vis")
+        logger.info("Saved NavSIM test visualization index to %s", vis_csv_path)
+        result["visualization_csv_path"] = vis_csv_path
+        result["image_num_samples"] = len(vis_rows)
+    return result
 
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")

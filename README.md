@@ -211,6 +211,9 @@ num_workers: 16
 
 model:
   mot_checkpoint_mixed_attn: false
+  loss:
+    lambda_video: 0.1
+    lambda_action: 1.0
 
 num_epochs: 50
 save_every: 1774
@@ -235,7 +238,7 @@ wandb:
 
 `save_every` and `eval_every` are step intervals, not epoch counts. Set them to the number of optimizer steps in one epoch if you want one save/eval per epoch.
 
-Global defaults such as learning rate, scheduler, precision, gradient clipping, and loss weights live in `configs/train.yaml`. The NavSIM task only overrides the fields shown above.
+Global defaults such as learning rate, scheduler, precision, and gradient clipping live in `configs/train.yaml`. The NavSIM task overrides the fields shown above, including the video/action loss weights.
 
 ## Training
 
@@ -362,6 +365,7 @@ The script:
 - runs `model.infer_action`
 - writes per-token metrics and an average row
 - writes a NAVSIM-style submission pickle
+- saves test visualizations when `eval_visualization.enabled=true`, or when `test_visualization` is provided
 
 Outputs:
 
@@ -369,6 +373,32 @@ Outputs:
 navsim_test_metrics.csv
 submission.pkl
 eval_config.yaml
+vis/index.csv
+vis/world_model/*.png
+vis/trajectory/*.png
+```
+
+By default, the current task config enables 32 visualization samples through `eval_visualization`. Test visualization uses the same fields unless you add a test-only override:
+
+```bash
+python scripts/evaluate_navsim.py \
+  task=navsim_v1_uncond_camf0_352x640_1e-4 \
+  resume=/path/to/run/checkpoints/weights/step_XXXXXX.pt \
+  output_dir=./runs/eval_navtest_step_XXXXXX \
+  +test_visualization.enabled=true \
+  +test_visualization.num_samples=32 \
+  +test_visualization.world_model=true \
+  +test_visualization.trajectory=true
+```
+
+To disable visualization for a metrics-only test run:
+
+```bash
+python scripts/evaluate_navsim.py \
+  task=navsim_v1_uncond_camf0_352x640_1e-4 \
+  resume=/path/to/run/checkpoints/weights/step_XXXXXX.pt \
+  output_dir=./runs/eval_navtest_step_XXXXXX \
+  eval_visualization.enabled=false
 ```
 
 Test evaluation requires `data.test.metric_cache_path`. By default it is:

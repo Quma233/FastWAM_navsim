@@ -5,13 +5,15 @@ defaults:
   - override /model: fastwam
   - _self_
 
-# dataloading: full NavSIM training defaults for H200-class GPUs while leaving
-# optimizer/model/loss defaults inherited from FastWAM base configs.
+# dataloading: full NavSIM training defaults for H200-class GPUs.
 batch_size: 16
 num_workers: 16
 
 model:
   mot_checkpoint_mixed_attn: false
+  loss:
+    lambda_video: 0.1
+    lambda_action: 1.0
 
 # scheduler
 num_epochs: 50
