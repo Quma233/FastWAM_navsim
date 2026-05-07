@@ -293,15 +293,17 @@ python scripts/evaluate_navsim.py \
 
 ```bash
 python scripts/filter_bad_navsim_samples.py \
-  --metrics_csv /path/to/eval/navsim_test_metrics.csv \
+  --metrics_csv runs/.../eval/navsim_step_000100.csv \
+  --vis_index_csv runs/.../eval/vis/step_000100/index.csv \
+  --metric pdm_score \
   --threshold 0.3
 ```
 
-脚本会读取：
+脚本会读取 metrics CSV 和可视化索引：
 
 ```text
-navsim_test_metrics.csv
-vis/index.csv
+runs/.../eval/navsim_step_000100.csv
+runs/.../eval/vis/step_000100/index.csv
 ```
 
 默认使用 `--metric auto`，优先读 `score`，没有则读 `pdm_score`，并筛选 `metric < threshold` 的样本。每个 bad sample 会被整理到单独文件夹：

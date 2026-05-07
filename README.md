@@ -465,15 +465,17 @@ After running `scripts/evaluate_navsim.py` with visualization enabled, you can c
 
 ```bash
 python scripts/filter_bad_navsim_samples.py \
-  --metrics_csv /path/to/eval/navsim_test_metrics.csv \
+  --metrics_csv runs/.../eval/navsim_step_000100.csv \
+  --vis_index_csv runs/.../eval/vis/step_000100/index.csv \
+  --metric pdm_score \
   --threshold 0.3
 ```
 
-The script reads:
+The script reads the metrics CSV and the visualization index:
 
 ```text
-navsim_test_metrics.csv
-vis/index.csv
+runs/.../eval/navsim_step_000100.csv
+runs/.../eval/vis/step_000100/index.csv
 ```
 
 By default it uses `--metric auto`, which prefers `score` and falls back to `pdm_score`, and selects samples with `metric < threshold`. Each selected sample is copied to:
