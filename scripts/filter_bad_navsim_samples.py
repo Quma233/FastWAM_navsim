@@ -28,7 +28,9 @@ VISUALIZATION_COLUMNS = {
     "world_model_path": "future_rollout",
 }
 
-AUTO_METRIC_CANDIDATES = ("score", "pdm_score")
+TEST_SCORE_METRIC = "score"
+AUTO_METRIC_CANDIDATES = (TEST_SCORE_METRIC, "pdm_score")
+METRIC_ALIASES = {"pdm_score": TEST_SCORE_METRIC}
 
 
 def _safe_name(value: object, *, max_len: int = 140) -> str:
@@ -115,14 +117,40 @@ def _load_visualization_rows(vis_index_csv: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
-def _metric_value(metrics: dict[str, float], metric_name: str) -> tuple[Optional[str], Optional[float]]:
-    if metric_name != "auto":
-        return (metric_name, metrics.get(metric_name))
+def _available_metrics(metric_rows: dict[str, dict[str, object]]) -> list[str]:
+    available: set[str] = set()
+    for row in metric_rows.values():
+        metrics = row.get("metrics", {})
+        if isinstance(metrics, dict):
+            available.update(str(key) for key in metrics.keys())
+    return sorted(available)
 
-    for candidate in AUTO_METRIC_CANDIDATES:
-        if candidate in metrics:
-            return candidate, metrics[candidate]
-    return None, None
+
+def _resolve_filter_metric(requested_metric: str, metric_rows: dict[str, dict[str, object]]) -> str:
+    requested_metric = str(requested_metric).strip()
+    available = set(_available_metrics(metric_rows))
+    if not available:
+        raise ValueError("No numeric metrics found in metrics_csv.")
+
+    if requested_metric == "auto":
+        candidates = AUTO_METRIC_CANDIDATES
+    elif requested_metric in METRIC_ALIASES:
+        candidates = (requested_metric, METRIC_ALIASES[requested_metric])
+    else:
+        candidates = (requested_metric,)
+
+    for candidate in candidates:
+        if candidate in available:
+            return candidate
+
+    raise ValueError(
+        f"Metric {requested_metric!r} not found in metrics_csv. "
+        f"Available metrics: {', '.join(sorted(available))}"
+    )
+
+
+def _metric_value(metrics: dict[str, float], metric_name: str) -> Optional[float]:
+    return metrics.get(metric_name)
 
 
 def _is_bad_sample(value: float, threshold: float, comparison: str) -> bool:
@@ -220,6 +248,35 @@ def _write_manifest(rows: list[dict[str, object]], output_dir: Path) -> Path:
     return manifest_path
 
 
+def _is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
+def _refresh_output_dir(output_dir: Path, *, metrics_csv: Path, vis_index_csv: Path) -> None:
+    resolved = output_dir.resolve()
+    protected = {
+        Path("/").resolve(),
+        Path.cwd().resolve(),
+        metrics_csv.parent.resolve(),
+        vis_index_csv.parent.resolve(),
+    }
+    unsafe = resolved in protected
+    unsafe = unsafe or _is_relative_to(metrics_csv.resolve(), resolved)
+    unsafe = unsafe or _is_relative_to(vis_index_csv.resolve(), resolved)
+    if unsafe:
+        raise ValueError(
+            f"Refusing to delete protected output_dir={output_dir}. "
+            "Choose a dedicated bad-sample directory."
+        )
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Filter NavSIM evaluation visualizations by PDM score and collect bad samples.",
@@ -229,7 +286,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--metrics_csv",
         required=True,
         type=Path,
-        help="Path to navsim_test_metrics.csv or a val navsim_step_*.csv file.",
+        help="Path to navsim_test_metrics.csv from scripts/evaluate_navsim.py.",
     )
     parser.add_argument(
         "--vis_index_csv",
@@ -251,8 +308,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--metric",
-        default="auto",
-        help="Metric name to filter. Use 'auto' to prefer score, then pdm_score.",
+        default=TEST_SCORE_METRIC,
+        help="Metric name to filter. NavSIM test PDM score is 'score'. 'pdm_score' is accepted as an alias when score exists.",
     )
     parser.add_argument(
         "--comparison",
@@ -269,7 +326,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Delete an existing per-sample output folder before copying.",
+        help="Deprecated compatibility flag; output_dir is refreshed on every non-dry run.",
     )
     parser.add_argument(
         "--dry_run",
@@ -290,10 +347,12 @@ def main() -> None:
         raise FileNotFoundError(f"vis_index_csv not found: {vis_index_csv}")
 
     output_dir = args.output_dir.expanduser() if args.output_dir else metrics_csv.parent / "bad_samples"
-    if not args.dry_run:
-        output_dir.mkdir(parents=True, exist_ok=True)
 
     metric_rows = _load_metrics(metrics_csv)
+    filter_metric = _resolve_filter_metric(args.metric, metric_rows)
+    if not args.dry_run:
+        _refresh_output_dir(output_dir, metrics_csv=metrics_csv, vis_index_csv=vis_index_csv)
+
     vis_rows = _load_visualization_rows(vis_index_csv)
     bases = [
         Path.cwd(),
@@ -312,14 +371,14 @@ def main() -> None:
         metric_row = metric_rows[sample_id]
         metrics = metric_row["metrics"]
         assert isinstance(metrics, dict)
-        selected_metric, value = _metric_value(metrics, args.metric)
-        if selected_metric is None or value is None:
+        value = _metric_value(metrics, filter_metric)
+        if value is None:
             continue
         if not _is_bad_sample(float(value), float(args.threshold), args.comparison):
             continue
 
         token = str(metric_row.get("token") or sample_id)
-        folder_name = f"{_safe_name(token)}_{_safe_name(selected_metric, max_len=40)}_{float(value):.4f}"
+        folder_name = f"{_safe_name(token)}_{_safe_name(filter_metric, max_len=40)}_{float(value):.4f}"
         sample_dir = output_dir / folder_name
         if sample_dir in seen_dirs:
             sample_dir = output_dir / f"{folder_name}_idx_{_safe_name(metric_row.get('idx', ''), max_len=30)}"
@@ -336,14 +395,14 @@ def main() -> None:
         )
         if not args.dry_run:
             sample_dir.mkdir(parents=True, exist_ok=True)
-            _write_sample_metrics(sample_dir, metric_row, selected_metric, float(value))
+            _write_sample_metrics(sample_dir, metric_row, filter_metric, float(value))
 
         selected.append(
             {
                 "idx": metric_row.get("idx", ""),
                 "token": token,
                 "log_name": metric_row.get("log_name", ""),
-                "metric": selected_metric,
+                "metric": filter_metric,
                 "value": f"{float(value):.10g}",
                 "sample_dir": str(sample_dir),
                 "bev_path": copied.get("bev_path", ""),
@@ -360,7 +419,9 @@ def main() -> None:
 
     print(f"metrics_csv: {metrics_csv}")
     print(f"vis_index_csv: {vis_index_csv}")
-    print(f"metric: {args.metric}")
+    print(f"metric: {filter_metric}")
+    if filter_metric != args.metric:
+        print(f"requested_metric: {args.metric}")
     print(f"rule: {args.comparison} {args.threshold}")
     print(f"selected_bad_samples: {len(selected)}")
     if manifest_path is not None:

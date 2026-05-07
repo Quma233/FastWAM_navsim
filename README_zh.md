@@ -293,20 +293,20 @@ python scripts/evaluate_navsim.py \
 
 ```bash
 python scripts/filter_bad_navsim_samples.py \
-  --metrics_csv runs/.../eval/navsim_step_000100.csv \
-  --vis_index_csv runs/.../eval/vis/step_000100/index.csv \
-  --metric pdm_score \
+  --metrics_csv runs/.../eval_navtest_step_060316/navsim_test_metrics.csv \
+  --vis_index_csv runs/.../eval_navtest_step_060316/vis/index.csv \
+  --metric score \
   --threshold 0.3
 ```
 
-脚本会读取 metrics CSV 和可视化索引：
+脚本会读取 test metrics CSV 和可视化索引：
 
 ```text
-runs/.../eval/navsim_step_000100.csv
-runs/.../eval/vis/step_000100/index.csv
+runs/.../eval_navtest_step_060316/navsim_test_metrics.csv
+runs/.../eval_navtest_step_060316/vis/index.csv
 ```
 
-默认使用 `--metric auto`，优先读 `score`，没有则读 `pdm_score`，并筛选 `metric < threshold` 的样本。每个 bad sample 会被整理到单独文件夹：
+`score` 是 test 输出里的 NAVSIM PDM score。脚本默认筛选 `score < threshold` 的样本。每次非 dry-run 运行都会刷新输出目录，因此多次运行不会混入旧的 bad-sample 结果。每个 bad sample 会被整理到单独文件夹：
 
 ```text
 bad_samples/<token>_<metric>_<value>/
@@ -321,7 +321,7 @@ future_rollout.png
 metrics.txt
 ```
 
-常用参数包括 `--metric pdm_score`、`--comparison le`、`--max_samples`、`--output_dir`、`--dry_run`。如果筛 val 阶段输出，需要同时传 `--metrics_csv runs/.../eval/navsim_step_XXXXXX.csv` 和 `--vis_index_csv runs/.../eval/vis/step_XXXXXX/index.csv`。
+常用参数包括 `--comparison le`、`--max_samples`、`--output_dir`、`--dry_run`。如果在 test 输出上误传 `--metric pdm_score`，脚本会在存在 `score` 字段时自动按 `score` 处理。
 
 `scripts/evaluate_navsim.py` 需要 `data.test.metric_cache_path` 有效，默认是：
 

@@ -465,20 +465,20 @@ After running `scripts/evaluate_navsim.py` with visualization enabled, you can c
 
 ```bash
 python scripts/filter_bad_navsim_samples.py \
-  --metrics_csv runs/.../eval/navsim_step_000100.csv \
-  --vis_index_csv runs/.../eval/vis/step_000100/index.csv \
-  --metric pdm_score \
+  --metrics_csv runs/.../eval_navtest_step_060316/navsim_test_metrics.csv \
+  --vis_index_csv runs/.../eval_navtest_step_060316/vis/index.csv \
+  --metric score \
   --threshold 0.3
 ```
 
-The script reads the metrics CSV and the visualization index:
+The script reads the test metrics CSV and the visualization index:
 
 ```text
-runs/.../eval/navsim_step_000100.csv
-runs/.../eval/vis/step_000100/index.csv
+runs/.../eval_navtest_step_060316/navsim_test_metrics.csv
+runs/.../eval_navtest_step_060316/vis/index.csv
 ```
 
-By default it uses `--metric auto`, which prefers `score` and falls back to `pdm_score`, and selects samples with `metric < threshold`. Each selected sample is copied to:
+`score` is the NAVSIM PDM score in test output. The script selects samples with `score < threshold` by default. It refreshes the output directory on every non-dry run, so repeated runs do not mix old and new bad-sample results. Each selected sample is copied to:
 
 ```text
 bad_samples/<token>_<metric>_<value>/
@@ -493,7 +493,7 @@ future_rollout.png
 metrics.txt
 ```
 
-Use `--metric pdm_score`, `--comparison le`, `--max_samples`, `--output_dir`, or `--dry_run` when needed. For validation outputs, pass both `--metrics_csv runs/.../eval/navsim_step_XXXXXX.csv` and `--vis_index_csv runs/.../eval/vis/step_XXXXXX/index.csv`.
+Use `--comparison le`, `--max_samples`, `--output_dir`, or `--dry_run` when needed. If you accidentally pass `--metric pdm_score` on test output, the script aliases it to `score` when that field exists.
 
 Test evaluation requires `data.test.metric_cache_path`. By default it is:
 
