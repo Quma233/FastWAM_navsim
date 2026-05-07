@@ -459,6 +459,40 @@ python scripts/evaluate_navsim.py \
   +test_visualization.bev=false
 ```
 
+## Bad Sample Filtering
+
+After running `scripts/evaluate_navsim.py` with visualization enabled, you can collect low-PDM samples into per-sample folders without rerunning inference:
+
+```bash
+python scripts/filter_bad_navsim_samples.py \
+  --metrics_csv /path/to/eval/navsim_test_metrics.csv \
+  --threshold 0.3
+```
+
+The script reads:
+
+```text
+navsim_test_metrics.csv
+vis/index.csv
+```
+
+By default it uses `--metric auto`, which prefers `score` and falls back to `pdm_score`, and selects samples with `metric < threshold`. Each selected sample is copied to:
+
+```text
+bad_samples/<token>_<metric>_<value>/
+```
+
+Each folder contains the existing visualizations:
+
+```text
+bev.png
+camera_trajectory.png
+future_rollout.png
+metrics.txt
+```
+
+Use `--metric pdm_score`, `--comparison le`, `--max_samples`, `--output_dir`, or `--dry_run` when needed. For validation outputs, pass both `--metrics_csv runs/.../eval/navsim_step_XXXXXX.csv` and `--vis_index_csv runs/.../eval/vis/step_XXXXXX/index.csv`.
+
 Test evaluation requires `data.test.metric_cache_path`. By default it is:
 
 ```text

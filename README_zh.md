@@ -287,6 +287,40 @@ python scripts/evaluate_navsim.py \
   +test_visualization.bev=false
 ```
 
+## Bad Sample 筛选
+
+如果已经用 `scripts/evaluate_navsim.py` 保存过可视化，可以直接按 PDM 分数阈值筛 bad samples，不需要重新推理：
+
+```bash
+python scripts/filter_bad_navsim_samples.py \
+  --metrics_csv /path/to/eval/navsim_test_metrics.csv \
+  --threshold 0.3
+```
+
+脚本会读取：
+
+```text
+navsim_test_metrics.csv
+vis/index.csv
+```
+
+默认使用 `--metric auto`，优先读 `score`，没有则读 `pdm_score`，并筛选 `metric < threshold` 的样本。每个 bad sample 会被整理到单独文件夹：
+
+```text
+bad_samples/<token>_<metric>_<value>/
+```
+
+每个文件夹内包含已有的可视化：
+
+```text
+bev.png
+camera_trajectory.png
+future_rollout.png
+metrics.txt
+```
+
+常用参数包括 `--metric pdm_score`、`--comparison le`、`--max_samples`、`--output_dir`、`--dry_run`。如果筛 val 阶段输出，需要同时传 `--metrics_csv runs/.../eval/navsim_step_XXXXXX.csv` 和 `--vis_index_csv runs/.../eval/vis/step_XXXXXX/index.csv`。
+
 `scripts/evaluate_navsim.py` 需要 `data.test.metric_cache_path` 有效，默认是：
 
 ```text
