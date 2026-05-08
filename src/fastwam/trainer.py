@@ -647,13 +647,6 @@ class Wan22Trainer:
         model.eval()
 
         local_rows: list[dict] = []
-        local_vis_rows: list[dict] = []
-        vis_cfg = self._navsim_eval_visualization_cfg()
-        vis_indices = (
-            self._select_first_indices(len(self.val_dataset), int(vis_cfg["num_samples"]))
-            if bool(vis_cfg["enabled"])
-            else set()
-        )
         indices = range(self.accelerator.process_index, len(self.val_dataset), self.accelerator.num_processes)
         for idx in indices:
             raw_sample = self.val_dataset[idx]
@@ -702,24 +695,11 @@ class Wan22Trainer:
                 if pdm_metrics is not None:
                     row.update(pdm_metrics)
             local_rows.append(row)
-            if idx in vis_indices:
-                local_vis_rows.append(
-                    self._save_navsim_eval_visualization(
-                        idx=idx,
-                        raw_sample=raw_sample,
-                        sample=sample,
-                        pred_action_denorm=pred_action_denorm,
-                        gt_action_denorm=gt_action_denorm,
-                        model=model,
-                        vis_cfg=vis_cfg,
-                    )
-                )
 
         if was_dit_training:
             self._set_dit_only_train_mode()
 
         all_rows = self._gather_object_rows(local_rows)
-        all_vis_rows = self._gather_object_rows(local_vis_rows)
         if not self.accelerator.is_main_process:
             return None
         if not all_rows:
@@ -742,21 +722,6 @@ class Wan22Trainer:
             values = [float(row[key]) for row in all_rows if key in row and isinstance(row[key], (int, float))]
             if values:
                 result[key] = float(np.mean(values))
-        if all_vis_rows:
-            all_vis_rows = sorted(all_vis_rows, key=lambda row: int(row.get("idx", 0)))
-            vis_dir = os.path.join(self.eval_dir, "vis", f"step_{self.global_step:06d}")
-            vis_csv_path = self._write_navsim_visualization_csv(all_vis_rows, vis_dir)
-            result["visualization_csv_path"] = vis_csv_path
-            result["image_num_samples"] = int(len(all_vis_rows))
-            for key in ("psnr_rg", "ssim_rg"):
-                values = [
-                    float(row[key])
-                    for row in all_vis_rows
-                    if key in row and isinstance(row[key], (int, float))
-                ]
-                if values:
-                    result[key] = float(np.mean(values))
-            logger.info("Saved NAVSIM validation visualizations to %s", vis_dir)
         logger.info("Saved NAVSIM full validation CSV to %s", csv_path)
         return result
 
