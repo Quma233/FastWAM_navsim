@@ -3,9 +3,14 @@ import json
 import logging
 import os
 import re
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
+
+_REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if _REPO_SRC.is_dir():
+    sys.path.insert(0, str(_REPO_SRC))
 
 import hydra
 import torch

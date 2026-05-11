@@ -3,6 +3,7 @@
 outputs/
 checkpoints
 data/*
+conda_envs/
 apex/
 assets/
 runs

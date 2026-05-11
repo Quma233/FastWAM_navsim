@@ -1,5 +1,6 @@
 import hashlib
 import os
+from collections import OrderedDict
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -16,6 +17,11 @@ from fastwam.datasets.lerobot.utils.normalizer import (
     LinearNormalizer,
     load_dataset_stats_from_json,
     save_dataset_stats_to_json,
+)
+from fastwam.datasets.navsim_io import (
+    MoxingNavsimIO,
+    build_metric_cache_loader,
+    normalize_storage_mode,
 )
 from fastwam.utils import misc
 from fastwam.utils.logging_config import get_logger
@@ -61,11 +67,22 @@ class NavsimV1FastWAMDataset(Dataset):
         norm_default_mode: str = "z-score",
         norm_exception_mode: Optional[dict[str, dict[str, str]]] = None,
         metric_cache_path: Optional[str] = None,
+        storage_mode: str = "local",
+        image_cache_size: int = 0,
         filter_missing_images: bool = True,
     ):
         super().__init__()
-        self.navsim_log_path = Path(str(navsim_log_path)).expanduser()
-        self.sensor_blobs_path = Path(str(sensor_blobs_path)).expanduser()
+        self.storage_mode = normalize_storage_mode(storage_mode, navsim_log_path, sensor_blobs_path, metric_cache_path)
+        self._obs_io: Optional[MoxingNavsimIO] = None
+        self._obs_io_pid: Optional[int] = None
+        self.image_cache_size = max(int(image_cache_size), 0)
+        self._image_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+        if self.storage_mode == "obs":
+            self.navsim_log_path = str(navsim_log_path).rstrip("/")
+            self.sensor_blobs_path = str(sensor_blobs_path).rstrip("/")
+        else:
+            self.navsim_log_path = Path(str(navsim_log_path)).expanduser()
+            self.sensor_blobs_path = Path(str(sensor_blobs_path)).expanduser()
         self.split = str(split).lower().strip()
         self.split_proportion = float(split_proportion)
         self.split_mode = str(split_mode).lower().strip()
@@ -107,10 +124,11 @@ class NavsimV1FastWAMDataset(Dataset):
             raise ValueError(f"FastWAM video frames must satisfy T % 4 == 1, got {self.num_video_frames}.")
         if self.video_size[0] % 16 != 0 or self.video_size[1] % 16 != 0:
             raise ValueError(f"video_size must be multiples of 16, got {self.video_size}.")
-        if not self.navsim_log_path.is_dir():
-            raise FileNotFoundError(f"navsim_log_path does not exist: {self.navsim_log_path}")
-        if not self.sensor_blobs_path.is_dir():
-            raise FileNotFoundError(f"sensor_blobs_path does not exist: {self.sensor_blobs_path}")
+        if self.storage_mode == "local":
+            if not self.navsim_log_path.is_dir():
+                raise FileNotFoundError(f"navsim_log_path does not exist: {self.navsim_log_path}")
+            if not self.sensor_blobs_path.is_dir():
+                raise FileNotFoundError(f"sensor_blobs_path does not exist: {self.sensor_blobs_path}")
 
         if isinstance(shape_meta, DictConfig):
             shape_meta = OmegaConf.to_container(shape_meta, resolve=True)
@@ -142,15 +160,32 @@ class NavsimV1FastWAMDataset(Dataset):
         self._metric_cache_checked = False
 
         logger.info(
-            "NAVSIM v1 %s dataset ready: samples=%d split_mode=%s navsim_split=%s log_path=%s camera=%s video_size=%s",
+            "NAVSIM v1 %s dataset ready: samples=%d storage=%s split_mode=%s navsim_split=%s log_path=%s camera=%s video_size=%s",
             self.split,
             len(self.samples),
+            self.storage_mode,
             self.split_mode,
             self.navsim_split_name,
             self.navsim_log_path,
             self.camera,
             self.video_size,
         )
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_obs_io"] = None
+        state["_obs_io_pid"] = None
+        state["_image_cache"] = OrderedDict()
+        state["_metric_cache_loader"] = None
+        state["_metric_cache_checked"] = False
+        return state
+
+    def _get_obs_io(self) -> MoxingNavsimIO:
+        pid = os.getpid()
+        if self._obs_io is None or self._obs_io_pid != pid:
+            self._obs_io = MoxingNavsimIO()
+            self._obs_io_pid = pid
+        return self._obs_io
 
     @staticmethod
     def _default_shape_meta() -> dict[str, Any]:
@@ -293,9 +328,102 @@ class NavsimV1FastWAMDataset(Dataset):
             }
         return samples
 
+    def _obs_log_files(self, scene_filter: Any) -> list[str]:
+        io_client = self._get_obs_io()
+        log_files = [
+            path
+            for path in io_client.list_directory(str(self.navsim_log_path))
+            if io_client.basename(path).endswith(".pkl")
+        ]
+        if scene_filter.log_names is not None:
+            allowed = set(scene_filter.log_names)
+            log_files = [
+                path
+                for path in log_files
+                if io_client.basename(path).replace(".pkl", "") in allowed
+            ]
+        log_files = sorted(log_files, key=io_client.basename)
+        if not log_files:
+            raise FileNotFoundError(f"No NAVSIM log pickle files found in {self.navsim_log_path}")
+        return log_files
+
+    def _obs_filter_scenes(self, scene_filter: Any) -> dict[str, list[dict[str, Any]]]:
+        def split_list(input_list: list[Any], num_frames: int, frame_interval: int) -> list[list[Any]]:
+            return [input_list[i : i + num_frames] for i in range(0, len(input_list), frame_interval)]
+
+        filtered_scenes: dict[str, list[dict[str, Any]]] = {}
+        filter_tokens = scene_filter.tokens is not None
+        tokens = set(scene_filter.tokens) if filter_tokens else set()
+        stop_loading = False
+        for log_pickle_path in self._obs_log_files(scene_filter):
+            scene_dict_list = self._get_obs_io().read_pickle(log_pickle_path)
+            for frame_list in split_list(scene_dict_list, scene_filter.num_frames, scene_filter.frame_interval):
+                if len(frame_list) < scene_filter.num_frames:
+                    continue
+                if scene_filter.has_route and len(frame_list[scene_filter.num_history_frames - 1]["roadblock_ids"]) == 0:
+                    continue
+                token = frame_list[scene_filter.num_history_frames - 1]["token"]
+                if filter_tokens and token not in tokens:
+                    continue
+                filtered_scenes[token] = frame_list
+                if scene_filter.max_scenes is not None and len(filtered_scenes) >= scene_filter.max_scenes:
+                    stop_loading = True
+                    break
+            if stop_loading:
+                break
+        return filtered_scenes
+
+    def _collect_obs_samples(
+        self,
+        scene_filter: Any,
+        current_frame_index: int,
+        filter_missing_images: bool,
+    ) -> list[dict[str, Any]]:
+        scene_loader = type("SceneLoaderView", (), {})()
+        scene_loader.scene_frames_dicts = self._obs_filter_scenes(scene_filter)
+        scene_loader.tokens = list(scene_loader.scene_frames_dicts.keys())
+        return self._collect_scene_samples(scene_loader, current_frame_index, filter_missing_images)
+
+    def _build_obs_index(self, filter_missing_images: bool) -> list[dict[str, Any]]:
+        from navsim.common.dataclasses import SceneFilter
+
+        if self.split_mode == "official":
+            scene_filter = self._build_official_scene_filter()
+            return self._collect_obs_samples(
+                scene_filter=scene_filter,
+                current_frame_index=scene_filter.num_history_frames - 1,
+                filter_missing_images=filter_missing_images,
+            )
+
+        scene_filter = SceneFilter(
+            num_history_frames=1,
+            num_future_frames=self.num_future_frames,
+            frame_interval=self.frame_interval,
+            has_route=self.has_route,
+            max_scenes=None,
+        )
+        all_samples = self._collect_obs_samples(
+            scene_filter=scene_filter,
+            current_frame_index=0,
+            filter_missing_images=filter_missing_images,
+        )
+        split_idx = int(len(all_samples) * self.split_proportion)
+        split_idx = min(max(split_idx, 1), max(len(all_samples) - 1, 1))
+        if self.split == "train":
+            selected = all_samples[:split_idx]
+        else:
+            selected = all_samples[split_idx:]
+
+        selected_tokens = {sample["token"] for sample in selected}
+        self._scene_frames_by_token = {token: self._scene_frames_by_token[token] for token in selected_tokens}
+        return selected
+
     def _build_index(self, filter_missing_images: bool) -> list[dict[str, Any]]:
         from navsim.common.dataloader import SceneLoader
         from navsim.common.dataclasses import SceneFilter
+
+        if self.storage_mode == "obs":
+            return self._build_obs_index(filter_missing_images=filter_missing_images)
 
         if not any(self.navsim_log_path.glob("*.pkl")):
             raise FileNotFoundError(f"No NAVSIM log pickle files found in {self.navsim_log_path}")
@@ -343,13 +471,21 @@ class NavsimV1FastWAMDataset(Dataset):
         self._scene_frames_by_token = {token: self._scene_frames_by_token[token] for token in selected_tokens}
         return selected
 
+    def _sensor_blob_path(self, relative_path: str | Path) -> str | Path:
+        if self.storage_mode == "obs":
+            return self._get_obs_io().join(str(self.sensor_blobs_path), relative_path)
+        return self.sensor_blobs_path / relative_path
+
     def _window_has_camera_images(self, window: list[dict[str, Any]]) -> bool:
         for frame in window:
             camera_dict = frame.get("cams", {}).get(self.camera)
             if camera_dict is None:
                 return False
-            image_path = self.sensor_blobs_path / camera_dict["data_path"]
-            if not image_path.is_file():
+            image_path = self._sensor_blob_path(camera_dict["data_path"])
+            if self.storage_mode == "obs":
+                if not self._get_obs_io().exists(image_path):
+                    return False
+            elif not image_path.is_file():
                 return False
         return True
 
@@ -388,6 +524,9 @@ class NavsimV1FastWAMDataset(Dataset):
         }
 
     def _load_camera_from_frame(self, frame: dict[str, Any]):
+        if self.storage_mode == "obs":
+            return self._load_obs_camera_from_frame(frame)
+
         from navsim.common.dataclasses import Cameras
 
         cameras = Cameras.from_camera_dict(
@@ -399,6 +538,25 @@ class NavsimV1FastWAMDataset(Dataset):
         if camera.image is None:
             raise FileNotFoundError(f"Missing {self.camera} image for token={frame.get('token')}")
         return camera
+
+    def _load_obs_camera_from_frame(self, frame: dict[str, Any]):
+        from navsim.common.dataclasses import Camera
+
+        camera_dict = frame.get("cams", {}).get(self.camera)
+        if camera_dict is None:
+            raise FileNotFoundError(f"Missing {self.camera} metadata for token={frame.get('token')}")
+        image_path = self._sensor_blob_path(camera_dict["data_path"])
+        try:
+            image = self._get_obs_io().read_image_array(image_path)
+        except Exception as exc:
+            raise FileNotFoundError(f"Failed to read {self.camera} image from OBS: {image_path}") from exc
+        return Camera(
+            image=image,
+            sensor2lidar_rotation=camera_dict["sensor2lidar_rotation"],
+            sensor2lidar_translation=camera_dict["sensor2lidar_translation"],
+            intrinsics=camera_dict["cam_intrinsic"],
+            distortion=camera_dict["distortion"],
+        )
 
     def _preprocess_camera_image(self, image: np.ndarray) -> np.ndarray:
         # Drive-JEPA NAVSIM v1 front-camera preprocessing: crop vertical borders, resize.
@@ -446,13 +604,45 @@ class NavsimV1FastWAMDataset(Dataset):
             },
         }
 
+    def _image_cache_get(self, cache_key: str) -> Optional[torch.Tensor]:
+        if self.image_cache_size <= 0:
+            return None
+        tensor = self._image_cache.get(cache_key)
+        if tensor is None:
+            return None
+        self._image_cache.move_to_end(cache_key)
+        return tensor
+
+    def _image_cache_put(self, cache_key: str, tensor: torch.Tensor) -> None:
+        if self.image_cache_size <= 0:
+            return
+        self._image_cache[cache_key] = tensor
+        self._image_cache.move_to_end(cache_key)
+        while len(self._image_cache) > self.image_cache_size:
+            self._image_cache.popitem(last=False)
+
+    def _load_frame_tensor(self, frame: dict[str, Any]) -> torch.Tensor:
+        camera_dict = frame.get("cams", {}).get(self.camera)
+        cache_key = None
+        if self.storage_mode == "obs":
+            if camera_dict is None:
+                raise FileNotFoundError(f"Missing {self.camera} metadata for token={frame.get('token')}")
+            cache_key = str(self._sensor_blob_path(camera_dict["data_path"]))
+            cached = self._image_cache_get(cache_key)
+            if cached is not None:
+                return cached
+        camera = self._load_camera_from_frame(frame)
+        image = self._preprocess_camera_image(camera.image)
+        tensor = torch.from_numpy(image).permute(2, 0, 1).contiguous()
+        if cache_key is not None:
+            self._image_cache_put(cache_key, tensor)
+        return tensor
+
     def _load_video_tensor(self, window: list[dict[str, Any]]) -> torch.Tensor:
         frames = []
         for frame_idx, frame in enumerate(window):
             del frame_idx
-            camera = self._load_camera_from_frame(frame)
-            image = self._preprocess_camera_image(camera.image)
-            frames.append(torch.from_numpy(image).permute(2, 0, 1))
+            frames.append(self._load_frame_tensor(frame))
         return torch.stack(frames, dim=0).to(torch.uint8)
 
     @staticmethod
@@ -604,17 +794,20 @@ class NavsimV1FastWAMDataset(Dataset):
         self._metric_cache_checked = True
         if not self.metric_cache_path:
             return None
-        metric_cache_root = Path(self.metric_cache_path)
-        metadata_dir = metric_cache_root / "metadata"
-        if not metric_cache_root.exists() or not metadata_dir.exists():
-            logger.warning("NAVSIM metric cache not found at %s; skipping PDM metrics.", metric_cache_root)
-            return None
+        if self.storage_mode == "local":
+            metric_cache_root = Path(self.metric_cache_path)
+            metadata_dir = metric_cache_root / "metadata"
+            if not metric_cache_root.exists() or not metadata_dir.exists():
+                logger.warning("NAVSIM metric cache not found at %s; skipping PDM metrics.", metric_cache_root)
+                return None
         try:
-            from navsim.common.dataloader import MetricCacheLoader
-
-            self._metric_cache_loader = MetricCacheLoader(metric_cache_root)
+            self._metric_cache_loader = build_metric_cache_loader(
+                self.metric_cache_path,
+                storage_mode=self.storage_mode,
+                io_client=(self._get_obs_io() if self.storage_mode == "obs" else None),
+            )
         except Exception as exc:
-            logger.warning("Failed to initialize NAVSIM MetricCacheLoader at %s: %s", metric_cache_root, exc)
+            logger.warning("Failed to initialize NAVSIM MetricCacheLoader at %s: %s", self.metric_cache_path, exc)
             self._metric_cache_loader = None
         return self._metric_cache_loader
 

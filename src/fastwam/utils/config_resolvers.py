@@ -1,4 +1,5 @@
 import math
+import os
 from pathlib import Path
 from typing import Any, List, Callable, Optional
 from omegaconf import OmegaConf
@@ -54,6 +55,40 @@ def max_state_dim(embodiment_datasets_cfg):
                 
     return max_dim
 
+def _join_storage_path(root: str, suffix: str, *, expand_local: bool) -> str:
+    root = str(root).strip()
+    suffix = str(suffix).strip().lstrip("/")
+    if not suffix:
+        return os.path.expanduser(root) if expand_local else root.rstrip("/")
+    if expand_local:
+        return str(Path(os.path.expanduser(root)) / suffix)
+    return f"{root.rstrip('/')}/{suffix}"
+
+def navsim_storage_path(mode: str, local_root: str, obs_root: str, suffix: str) -> str:
+    """Resolve a NavSIM data path for local filesystem or OBS-backed moxing reads."""
+    key = str(mode).strip().lower()
+    if key == "local":
+        return _join_storage_path(local_root, suffix, expand_local=True)
+    if key == "obs":
+        return _join_storage_path(obs_root, suffix, expand_local=False)
+    raise ValueError(f"Unsupported NavSIM storage mode: {mode!r}. Expected 'local' or 'obs'.")
+
+def navsim_filter_missing_images(mode: str, obs_filter_missing_images: Any = False) -> bool:
+    key = str(mode).strip().lower()
+    if key == "local":
+        return True
+    if key == "obs":
+        return bool(obs_filter_missing_images)
+    raise ValueError(f"Unsupported NavSIM storage mode: {mode!r}. Expected 'local' or 'obs'.")
+
+def navsim_image_cache_size(mode: str, obs_image_cache_size: Any = 128) -> int:
+    key = str(mode).strip().lower()
+    if key == "local":
+        return 0
+    if key == "obs":
+        return max(int(obs_image_cache_size), 0)
+    raise ValueError(f"Unsupported NavSIM storage mode: {mode!r}. Expected 'local' or 'obs'.")
+
 def register_default_resolvers() -> None:
     """
     Register all resolvers commonly used across entrypoints.
@@ -68,3 +103,6 @@ def register_default_resolvers() -> None:
     _register("sum_shapes", sum_shapes)
     _register("max_action_dim", max_action_dim)
     _register("max_state_dim", max_state_dim)
+    _register("navsim_storage_path", navsim_storage_path)
+    _register("navsim_filter_missing_images", navsim_filter_missing_images)
+    _register("navsim_image_cache_size", navsim_image_cache_size)

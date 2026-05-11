@@ -27,10 +27,12 @@ FastWAM_navsim/
 │   ├── evaluate_navsim.py
 │   ├── precompute_text_embeds.py
 │   ├── preprocess_action_dit_backbone.py
+│   ├── run_di_navsim_obs.sh
 │   ├── setup_navsim_env.sh
 │   ├── train.py
 │   └── train_zero1.sh
 ├── src/fastwam/
+│   ├── datasets/navsim_io.py
 │   ├── datasets/navsim_v1.py
 │   ├── trainer.py
 │   └── utils/navsim_visualization.py
@@ -91,7 +93,7 @@ bash scripts/setup_navsim_env.sh
 
 ## Runtime Paths
 
-Set these before preprocessing, training, or evaluation:
+Set these before local preprocessing, training, or evaluation:
 
 ```bash
 export OPENSCENE_DATA_ROOT=/path/to/navsim_dataset/dataset
@@ -102,7 +104,7 @@ export NAVSIM_DEVKIT_ROOT=$(pwd)/third_party/navsim
 export DIFFSYNTH_MODEL_BASE_PATH=$(pwd)/checkpoints
 ```
 
-`configs/data/navsim_v1.yaml` contains placeholder fallbacks under `/path/to/navsim_dataset/...`. Prefer environment variables or Hydra overrides over committing machine-specific absolute paths.
+For OBS-backed training, `OPENSCENE_DATA_ROOT` and `NAVSIM_EXP_ROOT` are not used for NavSIM logs, sensor blobs, or metric cache. Use `data.storage.mode=obs` and `data.storage.obs_root=...` instead. `NUPLAN_MAPS_ROOT` is still useful for local map access if any downstream NAVSIM code needs it.
 
 ## Model Files
 
@@ -130,7 +132,8 @@ The NavSIM adapter is implemented in `src/fastwam/datasets/navsim_v1.py`.
 
 Default data behavior:
 
-- NAVSIM official `SceneFilter`, `SensorConfig`, and `SceneLoader` style loading.
+- local mode uses NAVSIM official `SceneFilter`, `SensorConfig`, and `SceneLoader` style loading.
+- OBS mode mirrors the required scene filtering in `NavsimV1FastWAMDataset` and reads pkl/image/metric-cache bytes through `mox.file`.
 - Official NAVSIM/Drive-JEPA split files, not a fixed sample ratio.
 - `CAM_F0` only.
 - Video shape `[3, 9, 352, 640]`.
@@ -141,10 +144,19 @@ Default data behavior:
 Current train/val defaults in `configs/data/navsim_v1.yaml`:
 
 ```yaml
+storage:
+  mode: local  # local | obs
+  obs_root: obs://yw-2030-gy/external/personal/f50000365/navsim_dataset
+  local_dataset_root: ${oc.env:OPENSCENE_DATA_ROOT,/cache/navsim_dataset/dataset}
+  local_exp_root: ${oc.env:NAVSIM_EXP_ROOT,/cache/navsim_dataset/exp}
+  obs_image_cache_size: 128
+  obs_filter_missing_images: false
+
 train:
-  navsim_log_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/navsim_logs/trainval
-  sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/sensor_blobs/trainval
-  metric_cache_path: ${oc.env:NAVSIM_EXP_ROOT,/path/to/navsim_dataset/exp}/metric_cache_v1.1.0_navtrain
+  navsim_log_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,navsim_logs/trainval}
+  sensor_blobs_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,sensor_blobs/trainval}
+  metric_cache_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_exp_root},${data.storage.obs_root}/exp,metric_cache_v1.1.0_navtrain}
+  storage_mode: ${data.storage.mode}
   split: train
   split_mode: official
   navsim_split_name: navtrain  # all_scenes
@@ -154,13 +166,15 @@ val:
   navsim_log_path: ${data.train.navsim_log_path}
   sensor_blobs_path: ${data.train.sensor_blobs_path}
   metric_cache_path: ${data.train.metric_cache_path}
+  storage_mode: ${data.train.storage_mode}
   split: val
   navsim_split_name: ${data.train.navsim_split_name}
 
 test:
-  navsim_log_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/navsim_logs/test
-  sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/sensor_blobs/test
-  metric_cache_path: ${oc.env:NAVSIM_EXP_ROOT,/path/to/navsim_dataset/exp}/metric_cache_v1.1.0_navtest
+  navsim_log_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,navsim_logs/test}
+  sensor_blobs_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,sensor_blobs/test}
+  metric_cache_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_exp_root},${data.storage.obs_root}/exp,metric_cache_v1.1.0_navtest}
+  storage_mode: ${data.storage.mode}
   split: test
   navsim_split_name: navtest
 ```
@@ -174,6 +188,42 @@ bash scripts/train_zero1.sh 2 task=navsim_v1_uncond_camf0_352x640_1e-4 \
   data.train.navsim_log_path=$OPENSCENE_DATA_ROOT/navsim_logs/mini \
   data.train.sensor_blobs_path=$OPENSCENE_DATA_ROOT/sensor_blobs/mini
 ```
+
+## OBS Online Data Mode
+
+NavSIM data can be read in two modes:
+
+- `local`: the default, using regular filesystem paths under `OPENSCENE_DATA_ROOT` and `NAVSIM_EXP_ROOT`.
+- `obs`: online reads through Huawei MoXing. Logs, images, and metric cache are read from OBS without copying the full NavSIM dataset to `/cache`.
+
+Switch to OBS with a task override or command-line override:
+
+```bash
+bash scripts/train_zero1.sh 8 task=navsim_v1_uncond_camf0_352x640_1e-4 \
+  data.storage.mode=obs \
+  data.storage.obs_root=obs://yw-2030-gy/external/personal/f50000365/navsim_dataset
+```
+
+The OBS root must match this structure:
+
+```text
+navsim_dataset/
+  dataset/navsim_logs/...
+  dataset/sensor_blobs/...
+  exp/metric_cache_v1.1.0_navtrain/...
+  exp/metric_cache_v1.1.0_navtest/...
+```
+
+OBS mode requires the official ModelArts MoXing package with `mox.file`, plus these S3-compatible OBS variables:
+
+```bash
+export S3_ENDPOINT=https://obs.cn-southwest-2.myhuaweicloud.com
+export S3_USE_HTTPS=0
+export ACCESS_KEY_ID=...
+export SECRET_ACCESS_KEY=...
+```
+
+Do not install the public PyPI package named `moxing`; it does not provide the `mox.file` API used here. Use the official ModelArts `moxing_framework-*.whl` when the runtime image does not already include MoXing.
 
 ## Text Embedding Cache
 
@@ -291,6 +341,75 @@ runs/<task>/<RUN_ID>/checkpoints/
 runs/<task>/<RUN_ID>/eval/navsim_step_*.csv
 runs/<task>/<RUN_ID>/eval/vis/
 ```
+
+## DI Platform Run Script
+
+`scripts/run_di_navsim_obs.sh` is the single-node 8-GPU launcher for the DI platform. It uses the current repo, a conda-pack environment placed under the repo, OBS-hosted checkpoints, OBS online NavSIM data, then runs navtest evaluation after training.
+
+Expected repo-local environment package:
+
+```text
+conda_envs/fastwam-conda-env.tar.gz
+```
+
+Expected OBS layout:
+
+```text
+obs://yw-2030-gy/external/personal/f50000365/FastWAM_navsim_di/
+  checkpoints/
+  data/text_embeds_cache/
+  runs/
+
+obs://yw-2030-gy/external/personal/f50000365/navsim_dataset/
+  dataset/navsim_logs/...
+  dataset/sensor_blobs/...
+  exp/metric_cache_v1.1.0_navtrain/...
+  exp/metric_cache_v1.1.0_navtest/...
+```
+
+Default run:
+
+```bash
+bash scripts/run_di_navsim_obs.sh
+```
+
+The script defaults to 8 GPUs. A numeric first argument is also accepted:
+
+```bash
+bash scripts/run_di_navsim_obs.sh 8
+```
+
+Smoke run:
+
+```bash
+SMOKE=1 bash scripts/run_di_navsim_obs.sh
+```
+
+Useful overrides:
+
+```bash
+RUN_ID=my_di_run_001 \
+OBS_REPO_ROOT=obs://yw-2030-gy/external/personal/f50000365/FastWAM_navsim_di \
+OBS_DATA_ROOT=obs://yw-2030-gy/external/personal/f50000365/navsim_dataset \
+bash scripts/run_di_navsim_obs.sh \
+  batch_size=8 \
+  num_workers=12
+```
+
+The script:
+
+- extracts `conda_envs/fastwam-conda-env.tar.gz` to `conda_envs/fastwam`
+- activates the unpacked environment and runs `conda-unpack` when available
+- installs the current repo with `pip install -e . --no-deps`
+- verifies or installs official `moxing_framework-*.whl`
+- syncs `${OBS_REPO_ROOT}/checkpoints/` into local `checkpoints/`
+- syncs or precomputes `data/text_embeds_cache/navsim_v1`
+- launches `scripts/train_zero1.sh 8 ... data.storage.mode=obs`
+- finds the newest `runs/<task>/<RUN_ID>/checkpoints/weights/step_*.pt`
+- runs `torchrun --standalone --nproc_per_node=8 scripts/evaluate_navsim.py ...`
+- uploads the whole run directory to `${OBS_REPO_ROOT}/runs/<task>/<RUN_ID>/`
+
+The script contains the OBS credentials from the DI sample script and does not print a full `env` dump. Override `ACCESS_KEY_ID` or `SECRET_ACCESS_KEY` externally if you need different credentials.
 
 ## Validation
 
@@ -543,6 +662,7 @@ Do not commit large runtime files:
 
 ```text
 checkpoints/
+conda_envs/
 runs/
 data/text_embeds_cache/
 *.pt

@@ -5,6 +5,10 @@ defaults:
   - override /model: fastwam
   - _self_
 
+data:
+  storage:
+    mode: local
+
 # dataloading: full NavSIM training defaults for H200-class GPUs.
 batch_size: 16
 num_workers: 16

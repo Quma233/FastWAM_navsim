@@ -1,8 +1,17 @@
+storage:
+  mode: local  # local | obs
+  obs_root: obs://yw-2030-gy/external/personal/f50000365/navsim_dataset
+  local_dataset_root: ${oc.env:OPENSCENE_DATA_ROOT,/cache/navsim_dataset/dataset}
+  local_exp_root: ${oc.env:NAVSIM_EXP_ROOT,/cache/navsim_dataset/exp}
+  obs_image_cache_size: 128
+  obs_filter_missing_images: false
+
 train:
   _target_: fastwam.datasets.navsim_v1.NavsimV1FastWAMDataset
-  navsim_log_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/navsim_logs/trainval
-  sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/sensor_blobs/trainval
-  metric_cache_path: ${oc.env:NAVSIM_EXP_ROOT,/path/to/navsim_dataset/exp}/metric_cache_v1.1.0_navtrain
+  navsim_log_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,navsim_logs/trainval}
+  sensor_blobs_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,sensor_blobs/trainval}
+  metric_cache_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_exp_root},${data.storage.obs_root}/exp,metric_cache_v1.1.0_navtrain}
+  storage_mode: ${data.storage.mode}
   split: train
   split_mode: official
   navsim_split_name: navtrain  # all_scenes
@@ -18,6 +27,8 @@ train:
   context_len: 128
   prompt: "A front camera video from an autonomous vehicle. Predict the ego vehicle's 4-second future trajectory."
   pretrained_norm_stats: null
+  image_cache_size: ${navsim_image_cache_size:${data.storage.mode},${data.storage.obs_image_cache_size}}
+  filter_missing_images: ${navsim_filter_missing_images:${data.storage.mode},${data.storage.obs_filter_missing_images}}
   is_training_set: true
   shape_meta:
     action:
@@ -40,6 +51,7 @@ val:
   navsim_log_path: ${data.train.navsim_log_path}
   sensor_blobs_path: ${data.train.sensor_blobs_path}
   metric_cache_path: ${data.train.metric_cache_path}
+  storage_mode: ${data.train.storage_mode}
   split: val
   split_mode: ${data.train.split_mode}
   navsim_split_name: ${data.train.navsim_split_name}
@@ -56,6 +68,8 @@ val:
   prompt: ${data.train.prompt}
   pretrained_norm_stats: null
   is_training_set: false
+  image_cache_size: ${data.train.image_cache_size}
+  filter_missing_images: ${data.train.filter_missing_images}
   shape_meta: ${data.train.shape_meta}
   processor: ${data.train.processor}
   use_stepwise_action_norm: ${data.train.use_stepwise_action_norm}
@@ -64,9 +78,10 @@ val:
 
 test:
   _target_: fastwam.datasets.navsim_v1.NavsimV1FastWAMDataset
-  navsim_log_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/navsim_logs/test
-  sensor_blobs_path: ${oc.env:OPENSCENE_DATA_ROOT,/path/to/navsim_dataset/dataset}/sensor_blobs/test
-  metric_cache_path: ${oc.env:NAVSIM_EXP_ROOT,/path/to/navsim_dataset/exp}/metric_cache_v1.1.0_navtest
+  navsim_log_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,navsim_logs/test}
+  sensor_blobs_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,sensor_blobs/test}
+  metric_cache_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_exp_root},${data.storage.obs_root}/exp,metric_cache_v1.1.0_navtest}
+  storage_mode: ${data.storage.mode}
   split: test
   split_mode: ${data.train.split_mode}
   navsim_split_name: navtest
@@ -83,6 +98,8 @@ test:
   prompt: ${data.train.prompt}
   pretrained_norm_stats: null
   is_training_set: false
+  image_cache_size: ${data.train.image_cache_size}
+  filter_missing_images: ${data.train.filter_missing_images}
   shape_meta: ${data.train.shape_meta}
   processor: ${data.train.processor}
   use_stepwise_action_norm: ${data.train.use_stepwise_action_norm}

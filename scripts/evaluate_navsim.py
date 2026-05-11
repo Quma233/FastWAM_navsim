@@ -2,9 +2,14 @@ import csv
 import os
 import pickle
 import re
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
+
+_REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if _REPO_SRC.is_dir():
+    sys.path.insert(0, str(_REPO_SRC))
 
 import hydra
 import numpy as np
@@ -13,6 +18,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
+from fastwam.datasets.navsim_io import build_metric_cache_loader, normalize_storage_mode
 from fastwam.runtime import (
     _mixed_precision_to_model_dtype,
     _normalize_mixed_precision,
@@ -340,21 +346,22 @@ def _save_navsim_test_visualization(
     return row
 
 
-def _create_pdm_objects(metric_cache_path: Optional[str]):
+def _create_pdm_objects(metric_cache_path: Optional[str], storage_mode: str = "local"):
     if metric_cache_path in (None, "", "null"):
         raise ValueError("NavSIM test evaluation requires `data.test.metric_cache_path` for PDM metrics.")
-    metric_cache_root = Path(str(metric_cache_path)).expanduser()
-    if not metric_cache_root.exists():
-        raise FileNotFoundError(f"Metric cache not found: {metric_cache_root}")
+    mode = normalize_storage_mode(storage_mode, metric_cache_path)
+    if mode == "local":
+        metric_cache_root = Path(str(metric_cache_path)).expanduser()
+        if not metric_cache_root.exists():
+            raise FileNotFoundError(f"Metric cache not found: {metric_cache_root}")
 
-    from navsim.common.dataloader import MetricCacheLoader
     from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer
     from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
     from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
     sampling = TrajectorySampling(num_poses=40, interval_length=0.1)
     return {
-        "loader": MetricCacheLoader(metric_cache_root),
+        "loader": build_metric_cache_loader(metric_cache_path, storage_mode=mode),
         "simulator": PDMSimulator(sampling),
         "scorer": PDMScorer(sampling),
         "sampling": sampling,
@@ -414,7 +421,7 @@ def run_navsim_evaluation(cfg: DictConfig) -> dict[str, Any]:
     if is_main_process:
         logger.info("Building NavSIM test dataset with pretrained_norm_stats=%s", stats_path)
     test_dataset = instantiate(cfg.data.test, pretrained_norm_stats=stats_path)
-    pdm_objects = _create_pdm_objects(test_dataset.metric_cache_path)
+    pdm_objects = _create_pdm_objects(test_dataset.metric_cache_path, storage_mode=cfg.data.test.get("storage_mode", "local"))
     vis_cfg = _visualization_cfg(cfg)
     vis_indices = (
         _select_first_indices(len(test_dataset), int(vis_cfg["num_samples"]))
