@@ -8,8 +8,8 @@ storage:
 
 train:
   _target_: fastwam.datasets.navsim_v1.NavsimV1FastWAMDataset
-  navsim_log_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,navsim_logs/trainval}
-  sensor_blobs_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,sensor_blobs/trainval}
+  navsim_log_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root},navsim_logs/trainval}
+  sensor_blobs_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root},sensor_blobs/trainval}
   metric_cache_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_exp_root},${data.storage.obs_root}/exp,metric_cache_v1.1.0_navtrain}
   storage_mode: ${data.storage.mode}
   split: train
@@ -78,8 +78,8 @@ val:
 
 test:
   _target_: fastwam.datasets.navsim_v1.NavsimV1FastWAMDataset
-  navsim_log_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,navsim_logs/test}
-  sensor_blobs_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,sensor_blobs/test}
+  navsim_log_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root},navsim_logs/test}
+  sensor_blobs_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root},sensor_blobs/test}
   metric_cache_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_exp_root},${data.storage.obs_root}/exp,metric_cache_v1.1.0_navtest}
   storage_mode: ${data.storage.mode}
   split: test

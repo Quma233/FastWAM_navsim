@@ -153,8 +153,8 @@ storage:
   obs_filter_missing_images: false
 
 train:
-  navsim_log_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,navsim_logs/trainval}
-  sensor_blobs_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,sensor_blobs/trainval}
+  navsim_log_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root},navsim_logs/trainval}
+  sensor_blobs_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root},sensor_blobs/trainval}
   metric_cache_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_exp_root},${data.storage.obs_root}/exp,metric_cache_v1.1.0_navtrain}
   storage_mode: ${data.storage.mode}
   split: train
@@ -171,8 +171,8 @@ val:
   navsim_split_name: ${data.train.navsim_split_name}
 
 test:
-  navsim_log_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,navsim_logs/test}
-  sensor_blobs_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root}/dataset,sensor_blobs/test}
+  navsim_log_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root},navsim_logs/test}
+  sensor_blobs_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_dataset_root},${data.storage.obs_root},sensor_blobs/test}
   metric_cache_path: ${navsim_storage_path:${data.storage.mode},${data.storage.local_exp_root},${data.storage.obs_root}/exp,metric_cache_v1.1.0_navtest}
   storage_mode: ${data.storage.mode}
   split: test
@@ -208,8 +208,8 @@ The OBS root must match this structure:
 
 ```text
 navsim_dataset/
-  dataset/navsim_logs/...
-  dataset/sensor_blobs/...
+  navsim_logs/...
+  sensor_blobs/...
   exp/metric_cache_v1.1.0_navtrain/...
   exp/metric_cache_v1.1.0_navtest/...
 ```
@@ -344,13 +344,18 @@ runs/<task>/<RUN_ID>/eval/vis/
 
 ## DI Platform Run Script
 
-`scripts/run_di_navsim_obs.sh` is the single-node 8-GPU launcher for the DI platform. It uses the current repo, a conda-pack environment placed under the repo, OBS-hosted checkpoints, OBS online NavSIM data, then runs navtest evaluation after training.
+`scripts/run_di_navsim_obs.sh` is the single-node 8-GPU launcher for the DI platform. It uses the current repo, an already-unpacked conda-pack environment placed under the repo, OBS-hosted checkpoints, OBS online NavSIM data, then runs navtest evaluation after training.
 
-Expected repo-local environment package:
+Expected repo-local environment directory:
 
 ```text
-conda_envs/fastwam-conda-env.tar.gz
+conda_envs/fastwam/
+  bin/python
+  bin/activate
+  bin/conda-unpack
 ```
+
+Place the unpacked environment directory under `conda_envs/fastwam`. The DI launcher activates it and runs `conda-unpack` before registering local packages.
 
 Expected OBS layout:
 
@@ -361,8 +366,8 @@ obs://yw-2030-gy/external/personal/f50000365/FastWAM_navsim_di/
   runs/
 
 obs://yw-2030-gy/external/personal/f50000365/navsim_dataset/
-  dataset/navsim_logs/...
-  dataset/sensor_blobs/...
+  navsim_logs/...
+  sensor_blobs/...
   exp/metric_cache_v1.1.0_navtrain/...
   exp/metric_cache_v1.1.0_navtest/...
 ```
@@ -398,10 +403,12 @@ bash scripts/run_di_navsim_obs.sh \
 
 The script:
 
-- extracts `conda_envs/fastwam-conda-env.tar.gz` to `conda_envs/fastwam`
-- activates the unpacked environment and runs `conda-unpack` when available
-- installs the current repo with `pip install -e . --no-deps`
+- requires the unpacked environment at `conda_envs/fastwam`
+- activates `conda_envs/fastwam`, then runs `conda-unpack`
+- does not run `scripts/setup_navsim_env.sh` or reinstall `requirements/fastwam_navsim_env.txt`
+- re-registers `third_party/nuplan-devkit-v1.2.tar.gz`, `third_party/navsim`, and the current repo with `pip install ... --no-deps`
 - verifies or installs official `moxing_framework-*.whl`
+- searches for the MoXing wheel under `/home/ma-user/modelarts/package`, `third_party/`, `conda_envs/`, and the repo root
 - syncs `${OBS_REPO_ROOT}/checkpoints/` into local `checkpoints/`
 - syncs or precomputes `data/text_embeds_cache/navsim_v1`
 - launches `scripts/train_zero1.sh 8 ... data.storage.mode=obs`

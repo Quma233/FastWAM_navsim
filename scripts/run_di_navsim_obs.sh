@@ -5,7 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-CONDA_ENV_ARCHIVE="${CONDA_ENV_ARCHIVE:-${REPO_ROOT}/conda_envs/fastwam-conda-env.tar.gz}"
 CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-${REPO_ROOT}/conda_envs/fastwam}"
 
 OBS_PERSONAL_ROOT="${OBS_PERSONAL_ROOT:-obs://yw-2030-gy/external/personal/f50000365}"
@@ -40,6 +39,7 @@ export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export DIFFSYNTH_MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-${REPO_ROOT}/checkpoints}"
 export NAVSIM_DEVKIT_ROOT="${NAVSIM_DEVKIT_ROOT:-${REPO_ROOT}/third_party/navsim}"
+NUPLAN_DEVKIT_PACKAGE="${NUPLAN_DEVKIT_PACKAGE:-${REPO_ROOT}/third_party/nuplan-devkit-v1.2.tar.gz}"
 export NUPLAN_MAP_VERSION="${NUPLAN_MAP_VERSION:-nuplan-maps-v1.0}"
 export OPENSCENE_DATA_ROOT="${OPENSCENE_DATA_ROOT:-/cache/navsim_dataset/dataset}"
 export NAVSIM_EXP_ROOT="${NAVSIM_EXP_ROOT:-/cache/navsim_dataset/exp}"
@@ -84,13 +84,14 @@ ensure_moxing() {
   local wheel=""
   local candidate_dirs=(
     "/home/ma-user/modelarts/package"
+    "${REPO_ROOT}/third_party"
     "${REPO_ROOT}/conda_envs"
     "${REPO_ROOT}"
   )
   local dir found
   for dir in "${candidate_dirs[@]}"; do
     [[ -d "${dir}" ]] || continue
-    found="$(find "${dir}" -maxdepth 1 \( -name 'moxing_framework-*.whl' -o -name '*moxing*framework*.whl' \) | sort -V | tail -n 1 || true)"
+    found="$(find "${dir}" -maxdepth 3 -type f \( -name 'moxing_framework-*.whl' -o -name '*moxing*framework*.whl' \) | sort -V | tail -n 1 || true)"
     if [[ -n "${found}" ]]; then
       wheel="${found}"
       break
@@ -180,12 +181,13 @@ trap upload_results EXIT
 
 print_runtime_info() {
   log "repo_root=${REPO_ROOT}"
-  log "conda_env_archive=${CONDA_ENV_ARCHIVE}"
   log "conda_env_prefix=${CONDA_ENV_PREFIX}"
   log "obs_repo_root=${OBS_REPO_ROOT}"
   log "obs_data_root=${OBS_DATA_ROOT}"
   log "obs_checkpoints_root=${OBS_CHECKPOINTS_ROOT}"
   log "obs_results_root=${OBS_RESULTS_ROOT}"
+  log "navsim_devkit_root=${NAVSIM_DEVKIT_ROOT}"
+  log "nuplan_devkit_package=${NUPLAN_DEVKIT_PACKAGE}"
   log "task=${TASK}"
   log "run_id=${RUN_ID}"
   log "nproc_per_node=${NPROC_PER_NODE}"
@@ -197,27 +199,45 @@ print_runtime_info() {
 }
 
 prepare_conda_env() {
-  if [[ ! -x "${CONDA_ENV_PREFIX}/bin/python" ]]; then
-    [[ -f "${CONDA_ENV_ARCHIVE}" ]] || die "conda-pack archive not found: ${CONDA_ENV_ARCHIVE}"
-    log "Extracting conda-pack environment to ${CONDA_ENV_PREFIX}"
-    mkdir -p "${CONDA_ENV_PREFIX}"
-    tar -xzf "${CONDA_ENV_ARCHIVE}" -C "${CONDA_ENV_PREFIX}"
-  else
-    log "Reusing existing conda-pack environment at ${CONDA_ENV_PREFIX}"
-  fi
+  [[ -d "${CONDA_ENV_PREFIX}" ]] || die "unpacked conda environment directory not found: ${CONDA_ENV_PREFIX}"
+  [[ -x "${CONDA_ENV_PREFIX}/bin/python" ]] || die "python not found in unpacked conda environment: ${CONDA_ENV_PREFIX}/bin/python"
+  [[ -f "${CONDA_ENV_PREFIX}/bin/activate" ]] || die "activate script not found in unpacked conda environment: ${CONDA_ENV_PREFIX}/bin/activate"
 
   # shellcheck source=/dev/null
   source "${CONDA_ENV_PREFIX}/bin/activate"
+  log "Activated unpacked conda environment: ${CONDA_ENV_PREFIX}"
   if command -v conda-unpack >/dev/null 2>&1; then
     log "Running conda-unpack"
-    conda-unpack || true
+    conda-unpack
+  else
+    die "conda-unpack not found after activating ${CONDA_ENV_PREFIX}"
   fi
   python -V
 }
 
-install_current_repo() {
-  log "Installing current repo in editable mode without dependency resolution"
+install_local_packages() {
+  [[ -f "${NUPLAN_DEVKIT_PACKAGE}" || -d "${NUPLAN_DEVKIT_PACKAGE}" ]] || die "nuPlan devkit package not found: ${NUPLAN_DEVKIT_PACKAGE}"
+  [[ -d "${NAVSIM_DEVKIT_ROOT}" ]] || die "NAVSIM devkit directory not found: ${NAVSIM_DEVKIT_ROOT}"
+
+  log "Registering vendored nuPlan devkit without dependency resolution"
+  python -m pip install "${NUPLAN_DEVKIT_PACKAGE}" --no-deps
+
+  log "Registering vendored NAVSIM devkit without dependency resolution"
+  python -m pip install -e "${NAVSIM_DEVKIT_ROOT}" --no-deps
+
+  log "Registering current repo in editable mode without dependency resolution"
   python -m pip install -e "${REPO_ROOT}" --no-deps
+
+  python - <<'PY'
+import navsim
+import nuplan
+import fastwam
+
+print("local package registration:")
+print("  navsim:", navsim.__file__)
+print("  nuplan:", nuplan.__file__)
+print("  fastwam:", fastwam.__file__)
+PY
 }
 
 sync_checkpoints() {
@@ -265,7 +285,7 @@ sync_or_build_text_embeds() {
 obs_smoke_check() {
   log "Checking OBS data root"
   mox_list_directory "${OBS_DATA_ROOT}"
-  mox_list_directory "${OBS_DATA_ROOT%/}/dataset/navsim_logs/trainval"
+  mox_list_directory "${OBS_DATA_ROOT%/}/navsim_logs/trainval"
 }
 
 run_training() {
@@ -339,7 +359,7 @@ run_navtest_evaluation() {
 main() {
   print_runtime_info
   prepare_conda_env
-  install_current_repo
+  install_local_packages
   ensure_moxing
   sync_checkpoints
   sync_or_build_text_embeds
