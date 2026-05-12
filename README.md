@@ -344,18 +344,26 @@ runs/<task>/<RUN_ID>/eval/vis/
 
 ## DI Platform Run Script
 
-`scripts/run_di_navsim_obs.sh` is the single-node 8-GPU launcher for the DI platform. It uses the current repo, an already-unpacked conda-pack environment placed under the repo, OBS-hosted checkpoints, OBS online NavSIM data, then runs navtest evaluation after training.
+`scripts/run_di_navsim_obs.sh` is the single-node 8-GPU launcher for the DI platform. It first syncs the repo from OBS to a local workspace, then uses the synced repo-local conda-pack environment that already includes MoXing, OBS-hosted checkpoints, OBS online NavSIM data, and runs navtest evaluation after training.
 
 Expected repo-local environment directory:
 
 ```text
-conda_envs/fastwam/
+conda_envs/fastwam_moxing_di/
   bin/python
   bin/activate
   bin/conda-unpack
 ```
 
-Place the unpacked environment directory under `conda_envs/fastwam`. The DI launcher activates it and runs `conda-unpack` before registering local packages.
+Default local repo sync target:
+
+```text
+${WORKSPACE:-/home/ma-user/code}/FastWAM_navsim_di
+```
+
+At startup, if the script is not already running from this target and `SYNC_REPO_FROM_OBS` is not `0`, it uses the launch environment's `moxing.file.copy_parallel` to copy `${OBS_REPO_ROOT}/` into that local directory, then re-executes the synced script. This mirrors the DI sample flow of copying code from OBS into `WORKSPACE` before running training. Because this bootstrap happens before the repo-local conda environment exists locally, the initial launcher environment must already provide `moxing.file`.
+
+Place the complete unpacked environment directory under `conda_envs/fastwam_moxing_di`. This environment is expected to already contain FastWAM runtime dependencies, NAVSIM/nuPlan dependencies, and the official ModelArts MoXing package with `mox.file`. The DI launcher activates it, runs `conda-unpack`, then re-registers the repo-local Python packages with `pip install --no-deps` so editable/package paths point at the current checkout.
 
 Expected OBS layout:
 
@@ -403,13 +411,14 @@ bash scripts/run_di_navsim_obs.sh \
 
 The script:
 
-- requires the unpacked environment at `conda_envs/fastwam`
-- activates `conda_envs/fastwam`, then runs `conda-unpack`
+- syncs `${OBS_REPO_ROOT}/` into `${WORKSPACE:-/home/ma-user/code}/FastWAM_navsim_di` before training, unless already running there or `SYNC_REPO_FROM_OBS=0`
+- requires the complete environment at `conda_envs/fastwam_moxing_di` inside the synced repo
+- activates `conda_envs/fastwam_moxing_di`, then runs `conda-unpack`
 - does not run `scripts/setup_navsim_env.sh` or reinstall `requirements/fastwam_navsim_env.txt`
 - re-registers `third_party/nuplan-devkit-v1.2.tar.gz`, `third_party/navsim`, and the current repo with `pip install ... --no-deps`
-- verifies or installs official `moxing_framework-*.whl`
-- searches for the MoXing wheel under `/home/ma-user/modelarts/package`, `third_party/`, `conda_envs/`, and the repo root
-- syncs `${OBS_REPO_ROOT}/checkpoints/` into local `checkpoints/`
+- does not install MoXing; `moxing.file` must already be available in `conda_envs/fastwam_moxing_di`
+- verifies that current repo `fastwam`, vendored `navsim`/`nuplan`, and environment `moxing.file` are importable
+- uses local `checkpoints/` from the synced repo, or syncs `${OBS_REPO_ROOT}/checkpoints/` if the key ActionDiT checkpoint is missing; set `FORCE_SYNC_CHECKPOINTS=1` to force resync
 - syncs or precomputes `data/text_embeds_cache/navsim_v1`
 - launches `scripts/train_zero1.sh 8 ... data.storage.mode=obs`
 - finds the newest `runs/<task>/<RUN_ID>/checkpoints/weights/step_*.pt`

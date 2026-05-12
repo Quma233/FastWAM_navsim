@@ -2,10 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-cd "${REPO_ROOT}"
-
-CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-${REPO_ROOT}/conda_envs/fastwam}"
+SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 OBS_PERSONAL_ROOT="${OBS_PERSONAL_ROOT:-obs://yw-2030-gy/external/personal/f50000365}"
 OBS_REPO_ROOT="${OBS_REPO_ROOT:-${OBS_PERSONAL_ROOT}/FastWAM_navsim_di}"
@@ -13,6 +10,85 @@ OBS_DATA_ROOT="${OBS_DATA_ROOT:-${OBS_PERSONAL_ROOT}/navsim_dataset}"
 OBS_CHECKPOINTS_ROOT="${OBS_CHECKPOINTS_ROOT:-${OBS_REPO_ROOT}/checkpoints}"
 OBS_TEXT_EMBEDS_ROOT="${OBS_TEXT_EMBEDS_ROOT:-${OBS_REPO_ROOT}/data/text_embeds_cache}"
 OBS_RESULTS_ROOT="${OBS_RESULTS_ROOT:-${OBS_REPO_ROOT}/runs}"
+
+WORKSPACE="${WORKSPACE:-/home/ma-user/code}"
+LOCAL_REPO_ROOT="${LOCAL_REPO_ROOT:-${WORKSPACE}/FastWAM_navsim_di}"
+
+export S3_ENDPOINT="${S3_ENDPOINT:-https://obs.cn-southwest-2.myhuaweicloud.com}"
+export S3_USE_HTTPS="${S3_USE_HTTPS:-0}"
+export ACCESS_KEY_ID="${ACCESS_KEY_ID:-HPUACJ8EWHNONWBP1PGQ}"
+export SECRET_ACCESS_KEY="${SECRET_ACCESS_KEY:-rx3ITEWElWS8dZnPHmFMmMiiGkQ2pk5FguQ0d1QN}"
+
+bootstrap_moxing_ok() {
+  python - <<'PY' >/dev/null 2>&1
+import moxing as mox
+if not hasattr(mox, "file"):
+    raise SystemExit(1)
+PY
+}
+
+bootstrap_sync_repo() {
+  local src="${OBS_REPO_ROOT%/}/"
+  local dst="${LOCAL_REPO_ROOT%/}/"
+
+  mkdir -p "$(dirname "${LOCAL_REPO_ROOT}")"
+  echo "[bootstrap] syncing repo: ${src} -> ${dst}"
+  python - "${src}" "${dst}" <<'PY'
+import sys
+import traceback
+import moxing as mox
+
+src, dst = sys.argv[1], sys.argv[2]
+try:
+    mox.file.copy_parallel(src, dst)
+except Exception as exc:
+    print(f"[bootstrap] repo copy failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    traceback.print_exc()
+    raise SystemExit(1)
+PY
+
+  [[ -f "${LOCAL_REPO_ROOT}/scripts/run_di_navsim_obs.sh" ]] || {
+    echo "[bootstrap] missing synced DI script: ${LOCAL_REPO_ROOT}/scripts/run_di_navsim_obs.sh" >&2
+    exit 1
+  }
+}
+
+bootstrap_sync_repo_if_needed() {
+  if [[ "${SYNC_REPO_FROM_OBS:-1}" == "0" ]]; then
+    return 0
+  fi
+  if [[ "${FASTWAM_DI_REPO_SYNCED:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  local script_root_real local_repo_real
+  script_root_real="$(cd "${SCRIPT_REPO_ROOT}" && pwd -P)"
+  mkdir -p "${LOCAL_REPO_ROOT}"
+  local_repo_real="$(cd "${LOCAL_REPO_ROOT}" && pwd -P)"
+  if [[ "${script_root_real}" == "${local_repo_real}" ]]; then
+    return 0
+  fi
+
+  if ! bootstrap_moxing_ok; then
+    echo "[bootstrap] moxing.file is required in the launch environment before the repo is synced from OBS." >&2
+    echo "[bootstrap] Run from a DI/ModelArts image or launcher environment that already provides MoXing." >&2
+    exit 1
+  fi
+
+  bootstrap_sync_repo
+  export FASTWAM_DI_REPO_SYNCED=1
+  exec bash "${LOCAL_REPO_ROOT}/scripts/run_di_navsim_obs.sh" "$@"
+}
+
+bootstrap_sync_repo_if_needed "$@"
+
+REPO_ROOT="${SCRIPT_REPO_ROOT}"
+if [[ "${FASTWAM_DI_REPO_SYNCED:-0}" == "1" ]]; then
+  REPO_ROOT="${LOCAL_REPO_ROOT}"
+fi
+cd "${REPO_ROOT}"
+
+CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-${REPO_ROOT}/conda_envs/fastwam_moxing_di}"
 
 TASK="${TASK:-navsim_v1_uncond_camf0_352x640_1e-4}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -27,11 +103,6 @@ fi
   echo "ERROR: NPROC_PER_NODE must be an integer, got: ${NPROC_PER_NODE}" >&2
   exit 1
 }
-
-export S3_ENDPOINT="${S3_ENDPOINT:-https://obs.cn-southwest-2.myhuaweicloud.com}"
-export S3_USE_HTTPS="${S3_USE_HTTPS:-0}"
-export ACCESS_KEY_ID="${ACCESS_KEY_ID:-HPUACJ8EWHNONWBP1PGQ}"
-export SECRET_ACCESS_KEY="${SECRET_ACCESS_KEY:-rx3ITEWElWS8dZnPHmFMmMiiGkQ2pk5FguQ0d1QN}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export RUN_ID
@@ -75,37 +146,30 @@ if not hasattr(mox, "file"):
 PY
 }
 
-ensure_moxing() {
-  if moxing_ok; then
-    log "moxing file API is available."
-    return 0
-  fi
+verify_runtime_environment() {
+  python - "${REPO_ROOT}" <<'PY'
+import sys
+from pathlib import Path
 
-  local wheel=""
-  local candidate_dirs=(
-    "/home/ma-user/modelarts/package"
-    "${REPO_ROOT}/third_party"
-    "${REPO_ROOT}/conda_envs"
-    "${REPO_ROOT}"
-  )
-  local dir found
-  for dir in "${candidate_dirs[@]}"; do
-    [[ -d "${dir}" ]] || continue
-    found="$(find "${dir}" -maxdepth 3 -type f \( -name 'moxing_framework-*.whl' -o -name '*moxing*framework*.whl' \) | sort -V | tail -n 1 || true)"
-    if [[ -n "${found}" ]]; then
-      wheel="${found}"
-      break
-    fi
-  done
+repo_root = Path(sys.argv[1])
+repo_src = repo_root / "src"
+if repo_src.is_dir():
+    sys.path.insert(0, str(repo_src))
 
-  [[ -n "${wheel}" ]] || die "moxing with mox.file is not available, and no official moxing_framework wheel was found."
+import fastwam
+import moxing as mox
+import navsim
+import nuplan
 
-  log "Installing official moxing wheel: ${wheel}"
-  python -m pip uninstall -y moxing moxing-framework moxing_framework >/dev/null 2>&1 || true
-  python -m pip install "${wheel}"
+if not hasattr(mox, "file"):
+    raise RuntimeError("moxing is importable, but mox.file is unavailable")
 
-  moxing_ok || die "moxing installation finished but mox.file is still unavailable."
-  log "moxing file API is available after installation."
+print("runtime imports:")
+print("  fastwam:", fastwam.__file__)
+print("  navsim:", navsim.__file__)
+print("  nuplan:", nuplan.__file__)
+print("  moxing:", mox.__file__)
+PY
 }
 
 mox_path_exists() {
@@ -206,7 +270,10 @@ prepare_conda_env() {
   # shellcheck source=/dev/null
   source "${CONDA_ENV_PREFIX}/bin/activate"
   log "Activated unpacked conda environment: ${CONDA_ENV_PREFIX}"
-  if command -v conda-unpack >/dev/null 2>&1; then
+  if [[ -x "${CONDA_ENV_PREFIX}/bin/conda-unpack" ]]; then
+    log "Running conda-unpack"
+    "${CONDA_ENV_PREFIX}/bin/conda-unpack"
+  elif command -v conda-unpack >/dev/null 2>&1; then
     log "Running conda-unpack"
     conda-unpack
   else
@@ -215,7 +282,7 @@ prepare_conda_env() {
   python -V
 }
 
-install_local_packages() {
+register_local_packages() {
   [[ -f "${NUPLAN_DEVKIT_PACKAGE}" || -d "${NUPLAN_DEVKIT_PACKAGE}" ]] || die "nuPlan devkit package not found: ${NUPLAN_DEVKIT_PACKAGE}"
   [[ -d "${NAVSIM_DEVKIT_ROOT}" ]] || die "NAVSIM devkit directory not found: ${NAVSIM_DEVKIT_ROOT}"
 
@@ -227,29 +294,23 @@ install_local_packages() {
 
   log "Registering current repo in editable mode without dependency resolution"
   python -m pip install -e "${REPO_ROOT}" --no-deps
-
-  python - <<'PY'
-import navsim
-import nuplan
-import fastwam
-
-print("local package registration:")
-print("  navsim:", navsim.__file__)
-print("  nuplan:", nuplan.__file__)
-print("  fastwam:", fastwam.__file__)
-PY
 }
 
 sync_checkpoints() {
   mkdir -p "${DIFFSYNTH_MODEL_BASE_PATH}"
+  local action_dit="${DIFFSYNTH_MODEL_BASE_PATH}/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"
+
   if is_enabled "${SYNC_CHECKPOINTS:-1}"; then
-    log "Syncing checkpoints from OBS"
-    mox_copy_parallel "${OBS_CHECKPOINTS_ROOT%/}/" "${DIFFSYNTH_MODEL_BASE_PATH%/}/" 1
+    if [[ -f "${action_dit}" ]] && ! is_enabled "${FORCE_SYNC_CHECKPOINTS:-0}"; then
+      log "Checkpoint directory already contains ActionDiT; skip OBS checkpoint sync. Set FORCE_SYNC_CHECKPOINTS=1 to resync."
+    else
+      log "Syncing checkpoints from OBS"
+      mox_copy_parallel "${OBS_CHECKPOINTS_ROOT%/}/" "${DIFFSYNTH_MODEL_BASE_PATH%/}/" 1
+    fi
   else
     log "SYNC_CHECKPOINTS=0, skip checkpoint sync."
   fi
 
-  local action_dit="${DIFFSYNTH_MODEL_BASE_PATH}/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"
   [[ -f "${action_dit}" ]] || die "Missing ActionDiT checkpoint: ${action_dit}"
   log "Checkpoint directory ready: ${DIFFSYNTH_MODEL_BASE_PATH}"
 }
@@ -359,8 +420,8 @@ run_navtest_evaluation() {
 main() {
   print_runtime_info
   prepare_conda_env
-  install_local_packages
-  ensure_moxing
+  register_local_packages
+  verify_runtime_environment
   sync_checkpoints
   sync_or_build_text_embeds
   obs_smoke_check
