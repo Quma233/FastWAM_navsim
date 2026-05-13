@@ -363,7 +363,7 @@ ${WORKSPACE:-/home/ma-user/code}/FastWAM_navsim_di
 
 At startup, if the script is not already running from this target and `SYNC_REPO_FROM_OBS` is not `0`, it uses the launch environment's `moxing.file.copy_parallel` to copy `${OBS_REPO_ROOT}/` into that local directory, then re-executes the synced script. This mirrors the DI sample flow of copying code from OBS into `WORKSPACE` before running training. Because this bootstrap happens before the repo-local conda environment exists locally, the initial launcher environment must already provide `moxing.file`.
 
-Place the complete unpacked environment directory under `conda_envs/fastwam_moxing_di`. This environment is expected to already contain FastWAM runtime dependencies, NAVSIM/nuPlan dependencies, and the official ModelArts MoXing package with `mox.file`. The DI launcher activates it, runs `conda-unpack`, then re-registers the repo-local Python packages with `pip install --no-deps` so editable/package paths point at the current checkout.
+Place the complete unpacked environment directory under `conda_envs/fastwam_moxing_di`. This environment is expected to already contain FastWAM runtime dependencies, NAVSIM/nuPlan dependencies, and a working MoXing package with `mox.file`. The DI launcher activates it, runs `conda-unpack`, downloads `moxing_framework-2.5.0rc6-py2.py3-none-any.whl` from OBS, installs that wheel with `pip install ... --upgrade-strategy only-if-needed`, then re-registers the repo-local Python packages with `pip install --no-deps` so editable/package paths point at the current checkout.
 
 Expected OBS layout:
 
@@ -414,9 +414,9 @@ The script:
 - syncs `${OBS_REPO_ROOT}/` into `${WORKSPACE:-/home/ma-user/code}/FastWAM_navsim_di` before training, unless already running there or `SYNC_REPO_FROM_OBS=0`
 - requires the complete environment at `conda_envs/fastwam_moxing_di` inside the synced repo
 - activates `conda_envs/fastwam_moxing_di`, then runs `conda-unpack`
+- downloads `obs://yw-ads-training-gy1/data/external/personal/z00009214/moxing_framework-2.5.0rc6-py2.py3-none-any.whl` with `moxing.file.copy`, then installs it with `pip install ... --upgrade-strategy only-if-needed`; set `INSTALL_MOXING_FROM_OBS=0` to skip this step
 - does not run `scripts/setup_navsim_env.sh` or reinstall `requirements/fastwam_navsim_env.txt`
 - re-registers `third_party/nuplan-devkit-v1.2.tar.gz`, `third_party/navsim`, and the current repo with `pip install ... --no-deps`
-- does not install MoXing; `moxing.file` must already be available in `conda_envs/fastwam_moxing_di`
 - verifies that current repo `fastwam`, vendored `navsim`/`nuplan`, and environment `moxing.file` are importable
 - uses local `checkpoints/` from the synced repo, or syncs `${OBS_REPO_ROOT}/checkpoints/` if the key ActionDiT checkpoint is missing; set `FORCE_SYNC_CHECKPOINTS=1` to force resync
 - syncs or precomputes `data/text_embeds_cache/navsim_v1`

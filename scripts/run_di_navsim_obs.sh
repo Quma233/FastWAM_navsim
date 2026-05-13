@@ -10,6 +10,8 @@ OBS_DATA_ROOT="${OBS_DATA_ROOT:-${OBS_PERSONAL_ROOT}/navsim_dataset}"
 OBS_CHECKPOINTS_ROOT="${OBS_CHECKPOINTS_ROOT:-${OBS_REPO_ROOT}/checkpoints}"
 OBS_TEXT_EMBEDS_ROOT="${OBS_TEXT_EMBEDS_ROOT:-${OBS_REPO_ROOT}/data/text_embeds_cache}"
 OBS_RESULTS_ROOT="${OBS_RESULTS_ROOT:-${OBS_REPO_ROOT}/runs}"
+MOXING_WHEEL_OBS_URI="${MOXING_WHEEL_OBS_URI:-obs://yw-ads-training-gy1/data/external/personal/z00009214/moxing_framework-2.5.0rc6-py2.py3-none-any.whl}"
+MOXING_WHEEL_NAME="${MOXING_WHEEL_NAME:-moxing_framework-2.5.0rc6-py2.py3-none-any.whl}"
 
 WORKSPACE="${WORKSPACE:-/home/ma-user/code}"
 LOCAL_REPO_ROOT="${LOCAL_REPO_ROOT:-${WORKSPACE}/FastWAM_navsim_di}"
@@ -250,6 +252,7 @@ print_runtime_info() {
   log "obs_data_root=${OBS_DATA_ROOT}"
   log "obs_checkpoints_root=${OBS_CHECKPOINTS_ROOT}"
   log "obs_results_root=${OBS_RESULTS_ROOT}"
+  log "moxing_wheel_obs_uri=${MOXING_WHEEL_OBS_URI}"
   log "navsim_devkit_root=${NAVSIM_DEVKIT_ROOT}"
   log "nuplan_devkit_package=${NUPLAN_DEVKIT_PACKAGE}"
   log "task=${TASK}"
@@ -280,6 +283,30 @@ prepare_conda_env() {
     die "conda-unpack not found after activating ${CONDA_ENV_PREFIX}"
   fi
   python -V
+}
+
+install_moxing_from_obs() {
+  if ! is_enabled "${INSTALL_MOXING_FROM_OBS:-1}"; then
+    log "INSTALL_MOXING_FROM_OBS=0, skip MoXing wheel installation."
+    return 0
+  fi
+
+  local wheel_path="${REPO_ROOT}/${MOXING_WHEEL_NAME}"
+  log "Downloading MoXing wheel from ${MOXING_WHEEL_OBS_URI}"
+  python - "${MOXING_WHEEL_OBS_URI}" "${wheel_path}" <<'PY'
+import sys
+import moxing
+
+src, dst = sys.argv[1], sys.argv[2]
+moxing.file.copy(src, dst)
+PY
+
+  [[ -f "${wheel_path}" ]] || die "MoXing wheel download failed: ${wheel_path}"
+  log "Installing MoXing wheel: ${wheel_path}"
+  python -m pip install "${wheel_path}" --upgrade-strategy only-if-needed
+
+  moxing_ok || die "MoXing installation finished but mox.file is unavailable."
+  log "MoXing file API is available after wheel installation."
 }
 
 register_local_packages() {
@@ -420,6 +447,7 @@ run_navtest_evaluation() {
 main() {
   print_runtime_info
   prepare_conda_env
+  install_moxing_from_obs
   register_local_packages
   verify_runtime_environment
   sync_checkpoints
