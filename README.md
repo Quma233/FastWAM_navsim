@@ -361,7 +361,7 @@ Default local repo sync target:
 ${WORKSPACE:-/home/ma-user/code}/FastWAM_navsim_di
 ```
 
-At startup, if the script is not already running from this target and `SYNC_REPO_FROM_OBS` is not `0`, it uses the launch environment's `moxing.file.copy_parallel` to copy `${OBS_REPO_ROOT}/` into that local directory, then re-executes the synced script. This mirrors the DI sample flow of copying code from OBS into `WORKSPACE` before running training. Because this bootstrap happens before the repo-local conda environment exists locally, the initial launcher environment must already provide `moxing.file`.
+At startup, if the script is not already running from this target and `SYNC_REPO_FROM_OBS` is not `0`, it initializes conda, activates `${BOOTSTRAP_CONDA_ENV:-qwen3}` like the DI sample script, uses that environment's existing `moxing.file` to download and install `moxing_framework-2.5.0rc6-py2.py3-none-any.whl`, copies `${OBS_REPO_ROOT}/` into the local directory with `moxing.file.copy_parallel`, deactivates the bootstrap environment, then re-executes the synced script. This mirrors the DI sample flow of copying code from OBS into `WORKSPACE` before running training.
 
 Place the complete unpacked environment directory under `conda_envs/fastwam_moxing_di`. This environment is expected to already contain FastWAM runtime dependencies, NAVSIM/nuPlan dependencies, and a working MoXing package with `mox.file`. The DI launcher activates it, runs `conda-unpack`, downloads `moxing_framework-2.5.0rc6-py2.py3-none-any.whl` from OBS, installs that wheel with `pip install ... --upgrade-strategy only-if-needed`, then re-registers the repo-local Python packages with `pip install --no-deps` so editable/package paths point at the current checkout.
 
@@ -411,7 +411,8 @@ bash scripts/run_di_navsim_obs.sh \
 
 The script:
 
-- syncs `${OBS_REPO_ROOT}/` into `${WORKSPACE:-/home/ma-user/code}/FastWAM_navsim_di` before training, unless already running there or `SYNC_REPO_FROM_OBS=0`
+- activates `${BOOTSTRAP_CONDA_ENV:-qwen3}` before the initial repo sync, updates MoXing in that bootstrap environment from the OBS wheel, then uses it to sync `${OBS_REPO_ROOT}/` into `${WORKSPACE:-/home/ma-user/code}/FastWAM_navsim_di`, unless already running there or `SYNC_REPO_FROM_OBS=0`
+- deactivates the bootstrap environment before re-entering the synced repo script
 - requires the complete environment at `conda_envs/fastwam_moxing_di` inside the synced repo
 - activates `conda_envs/fastwam_moxing_di`, then runs `conda-unpack`
 - downloads `obs://yw-ads-training-gy1/data/external/personal/z00009214/moxing_framework-2.5.0rc6-py2.py3-none-any.whl` with `moxing.file.copy`, then installs it with `pip install ... --upgrade-strategy only-if-needed`; set `INSTALL_MOXING_FROM_OBS=0` to skip this step

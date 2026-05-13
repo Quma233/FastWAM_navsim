@@ -15,13 +15,19 @@ MOXING_WHEEL_NAME="${MOXING_WHEEL_NAME:-moxing_framework-2.5.0rc6-py2.py3-none-a
 
 WORKSPACE="${WORKSPACE:-/home/ma-user/code}"
 LOCAL_REPO_ROOT="${LOCAL_REPO_ROOT:-${WORKSPACE}/FastWAM_navsim_di}"
+BOOTSTRAP_CONDA_ENV="${BOOTSTRAP_CONDA_ENV:-qwen3}"
+BOOTSTRAP_CONDA_BIN="${BOOTSTRAP_CONDA_BIN:-/root/miniconda3/bin/conda}"
+BOOTSTRAP_CONDA_SH="${BOOTSTRAP_CONDA_SH:-/root/miniconda3/etc/profile.d/conda.sh}"
+BOOTSTRAP_MOXING_WHEEL_PATH="${BOOTSTRAP_MOXING_WHEEL_PATH:-/tmp/${MOXING_WHEEL_NAME}}"
 
 export S3_ENDPOINT="${S3_ENDPOINT:-https://obs.cn-southwest-2.myhuaweicloud.com}"
 export S3_USE_HTTPS="${S3_USE_HTTPS:-0}"
 export ACCESS_KEY_ID="${ACCESS_KEY_ID:-HPUACJ8EWHNONWBP1PGQ}"
 export SECRET_ACCESS_KEY="${SECRET_ACCESS_KEY:-rx3ITEWElWS8dZnPHmFMmMiiGkQ2pk5FguQ0d1QN}"
 
-bootstrap_moxing_ok() {
+enabled() { case "${1:-}" in 1|true|TRUE|yes|YES|on|ON) return 0 ;; *) return 1 ;; esac; }
+
+moxing_ok() {
   python - <<'PY' >/dev/null 2>&1
 import moxing as mox
 if not hasattr(mox, "file"):
@@ -29,87 +35,100 @@ if not hasattr(mox, "file"):
 PY
 }
 
-bootstrap_sync_repo() {
-  local src="${OBS_REPO_ROOT%/}/"
-  local dst="${LOCAL_REPO_ROOT%/}/"
+activate_bootstrap_env() {
+  [[ -n "${BOOTSTRAP_CONDA_ENV}" ]] || return 0
+  local hook=""
+  if [[ -x "${BOOTSTRAP_CONDA_BIN}" ]]; then
+    hook="$(${BOOTSTRAP_CONDA_BIN} shell.bash hook 2>/dev/null || true)"
+  elif command -v conda >/dev/null 2>&1; then
+    hook="$(conda shell.bash hook 2>/dev/null || true)"
+  fi
+  if [[ -n "${hook}" ]]; then
+    eval "${hook}"
+  elif [[ -f "${BOOTSTRAP_CONDA_SH}" ]]; then
+    # shellcheck source=/dev/null
+    . "${BOOTSTRAP_CONDA_SH}"
+  elif [[ -x "${BOOTSTRAP_CONDA_BIN}" ]]; then
+    export PATH="$(dirname "${BOOTSTRAP_CONDA_BIN}"):${PATH}"
+  elif ! command -v conda >/dev/null 2>&1; then
+    echo "[bootstrap] conda not found; cannot activate ${BOOTSTRAP_CONDA_ENV}" >&2
+    exit 1
+  fi
+  echo "[bootstrap] activating conda env: ${BOOTSTRAP_CONDA_ENV}"
+  conda activate "${BOOTSTRAP_CONDA_ENV}"
+  export FASTWAM_BOOTSTRAP_CONDA_ACTIVE=1
+}
 
+install_moxing_wheel_from_obs() {
+  local wheel_path="$1" label="$2"
+  moxing_ok || { echo "${label} moxing.file is required before downloading ${MOXING_WHEEL_NAME}" >&2; exit 1; }
+  echo "${label} downloading MoXing wheel: ${MOXING_WHEEL_OBS_URI} -> ${wheel_path}"
+  python - "${MOXING_WHEEL_OBS_URI}" "${wheel_path}" <<'PY'
+import sys
+import moxing
+moxing.file.copy(sys.argv[1], sys.argv[2])
+PY
+  [[ -f "${wheel_path}" ]] || { echo "${label} missing wheel: ${wheel_path}" >&2; exit 1; }
+  echo "${label} installing MoXing wheel: ${wheel_path}"
+  python -m pip install "${wheel_path}" --upgrade-strategy only-if-needed
+  moxing_ok || { echo "${label} moxing.file unavailable after wheel install" >&2; exit 1; }
+}
+
+sync_repo_from_obs() {
+  local src="${OBS_REPO_ROOT%/}/" dst="${LOCAL_REPO_ROOT%/}/"
   mkdir -p "$(dirname "${LOCAL_REPO_ROOT}")"
   echo "[bootstrap] syncing repo: ${src} -> ${dst}"
   python - "${src}" "${dst}" <<'PY'
 import sys
 import traceback
 import moxing as mox
-
-src, dst = sys.argv[1], sys.argv[2]
 try:
-    mox.file.copy_parallel(src, dst)
+    mox.file.copy_parallel(sys.argv[1], sys.argv[2])
 except Exception as exc:
     print(f"[bootstrap] repo copy failed: {type(exc).__name__}: {exc}", file=sys.stderr)
     traceback.print_exc()
     raise SystemExit(1)
 PY
-
   [[ -f "${LOCAL_REPO_ROOT}/scripts/run_di_navsim_obs.sh" ]] || {
-    echo "[bootstrap] missing synced DI script: ${LOCAL_REPO_ROOT}/scripts/run_di_navsim_obs.sh" >&2
+    echo "[bootstrap] missing synced script: ${LOCAL_REPO_ROOT}/scripts/run_di_navsim_obs.sh" >&2
     exit 1
   }
 }
 
 bootstrap_sync_repo_if_needed() {
-  if [[ "${SYNC_REPO_FROM_OBS:-1}" == "0" ]]; then
-    return 0
-  fi
-  if [[ "${FASTWAM_DI_REPO_SYNCED:-0}" == "1" ]]; then
-    return 0
-  fi
-
-  local script_root_real local_repo_real
-  script_root_real="$(cd "${SCRIPT_REPO_ROOT}" && pwd -P)"
+  [[ "${SYNC_REPO_FROM_OBS:-1}" == "0" || "${FASTWAM_DI_REPO_SYNCED:-0}" == "1" ]] && return 0
   mkdir -p "${LOCAL_REPO_ROOT}"
-  local_repo_real="$(cd "${LOCAL_REPO_ROOT}" && pwd -P)"
-  if [[ "${script_root_real}" == "${local_repo_real}" ]]; then
-    return 0
-  fi
+  [[ "$(cd "${SCRIPT_REPO_ROOT}" && pwd -P)" == "$(cd "${LOCAL_REPO_ROOT}" && pwd -P)" ]] && return 0
 
-  if ! bootstrap_moxing_ok; then
-    echo "[bootstrap] moxing.file is required in the launch environment before the repo is synced from OBS." >&2
-    echo "[bootstrap] Run from a DI/ModelArts image or launcher environment that already provides MoXing." >&2
-    exit 1
+  activate_bootstrap_env
+  if enabled "${BOOTSTRAP_INSTALL_MOXING_FROM_OBS:-1}"; then
+    install_moxing_wheel_from_obs "${BOOTSTRAP_MOXING_WHEEL_PATH}" "[bootstrap]"
   fi
-
-  bootstrap_sync_repo
+  sync_repo_from_obs
+  if [[ "${FASTWAM_BOOTSTRAP_CONDA_ACTIVE:-0}" == "1" ]] && command -v conda >/dev/null 2>&1; then
+    echo "[bootstrap] deactivating conda env: ${BOOTSTRAP_CONDA_ENV}"
+    conda deactivate || true
+  fi
   export FASTWAM_DI_REPO_SYNCED=1
   exec bash "${LOCAL_REPO_ROOT}/scripts/run_di_navsim_obs.sh" "$@"
 }
-
 bootstrap_sync_repo_if_needed "$@"
 
 REPO_ROOT="${SCRIPT_REPO_ROOT}"
-if [[ "${FASTWAM_DI_REPO_SYNCED:-0}" == "1" ]]; then
-  REPO_ROOT="${LOCAL_REPO_ROOT}"
-fi
+[[ "${FASTWAM_DI_REPO_SYNCED:-0}" == "1" ]] && REPO_ROOT="${LOCAL_REPO_ROOT}"
 cd "${REPO_ROOT}"
 
 CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-${REPO_ROOT}/conda_envs/fastwam_moxing_di}"
-
 TASK="${TASK:-navsim_v1_uncond_camf0_352x640_1e-4}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 RUN_ID="${RUN_ID:-di_$(TZ=Asia/Shanghai date +%Y%m%d_%H%M%S)}"
 SMOKE="${SMOKE:-0}"
 
-if [[ $# -gt 0 && "${1}" =~ ^[0-9]+$ ]]; then
-  NPROC_PER_NODE="${1}"
-  shift
-fi
-[[ "${NPROC_PER_NODE}" =~ ^[0-9]+$ ]] || {
-  echo "ERROR: NPROC_PER_NODE must be an integer, got: ${NPROC_PER_NODE}" >&2
-  exit 1
-}
+if [[ $# -gt 0 && "${1}" =~ ^[0-9]+$ ]]; then NPROC_PER_NODE="$1"; shift; fi
+[[ "${NPROC_PER_NODE}" =~ ^[0-9]+$ ]] || { echo "ERROR: NPROC_PER_NODE must be an integer, got: ${NPROC_PER_NODE}" >&2; exit 1; }
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-export RUN_ID
-export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export RUN_ID HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}" PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export DIFFSYNTH_MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-${REPO_ROOT}/checkpoints}"
 export NAVSIM_DEVKIT_ROOT="${NAVSIM_DEVKIT_ROOT:-${REPO_ROOT}/third_party/navsim}"
 NUPLAN_DEVKIT_PACKAGE="${NUPLAN_DEVKIT_PACKAGE:-${REPO_ROOT}/third_party/nuplan-devkit-v1.2.tar.gz}"
@@ -124,101 +143,14 @@ DI_LOG_FILE="${RUN_OUTPUT_DIR}/di_run.log"
 mkdir -p "${RUN_OUTPUT_DIR}"
 exec > >(tee -a "${DI_LOG_FILE}") 2>&1
 
-log() {
-  printf '[%s] %s\n' "$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')" "$*"
-}
-
-die() {
-  log "ERROR: $*"
-  exit 1
-}
-
-is_enabled() {
-  case "${1:-}" in
-    1|true|TRUE|yes|YES|on|ON) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-moxing_ok() {
-  python - <<'PY' >/dev/null 2>&1
-import moxing as mox
-if not hasattr(mox, "file"):
-    raise SystemExit(1)
-PY
-}
-
-verify_runtime_environment() {
-  python - "${REPO_ROOT}" <<'PY'
-import sys
-from pathlib import Path
-
-repo_root = Path(sys.argv[1])
-repo_src = repo_root / "src"
-if repo_src.is_dir():
-    sys.path.insert(0, str(repo_src))
-
-import fastwam
-import moxing as mox
-import navsim
-import nuplan
-
-if not hasattr(mox, "file"):
-    raise RuntimeError("moxing is importable, but mox.file is unavailable")
-
-print("runtime imports:")
-print("  fastwam:", fastwam.__file__)
-print("  navsim:", navsim.__file__)
-print("  nuplan:", nuplan.__file__)
-print("  moxing:", mox.__file__)
-PY
-}
-
-mox_path_exists() {
-  local path="$1"
-  python - "${path}" <<'PY'
-import sys
-import moxing as mox
-
-path = sys.argv[1]
-try:
-    exists = getattr(mox.file, "exists", None)
-    if exists is not None and exists(path):
-        raise SystemExit(0)
-except Exception:
-    pass
-
-try:
-    mox.file.list_directory(path)
-    raise SystemExit(0)
-except Exception:
-    raise SystemExit(1)
-PY
-}
-
-mox_list_directory() {
-  local path="$1"
-  python - "${path}" <<'PY'
-import sys
-import moxing as mox
-
-path = sys.argv[1]
-entries = mox.file.list_directory(path)
-print(f"{path}: {len(entries)} entries")
-for entry in entries[:5]:
-    print(f"  {entry}")
-PY
-}
+log() { printf '[%s] %s\n' "$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+die() { log "ERROR: $*"; exit 1; }
 
 mox_copy_parallel() {
-  local src="$1"
-  local dst="$2"
-  local required="${3:-1}"
-  python - "${src}" "${dst}" "${required}" <<'PY'
+  python - "$1" "$2" "${3:-1}" <<'PY'
 import sys
 import traceback
 import moxing as mox
-
 src, dst, required = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 try:
     print(f"copy_parallel: {src} -> {dst}")
@@ -230,10 +162,40 @@ except Exception as exc:
 PY
 }
 
+mox_path_exists() {
+  python - "$1" <<'PY'
+import sys
+import moxing as mox
+path = sys.argv[1]
+try:
+    exists = getattr(mox.file, "exists", None)
+    if exists is not None and exists(path):
+        raise SystemExit(0)
+except Exception:
+    pass
+try:
+    mox.file.list_directory(path)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+mox_list_directory() {
+  python - "$1" <<'PY'
+import sys
+import moxing as mox
+path = sys.argv[1]
+entries = mox.file.list_directory(path)
+print(f"{path}: {len(entries)} entries")
+for entry in entries[:5]:
+    print(f"  {entry}")
+PY
+}
+
 upload_results() {
   local exit_code=$?
   set +e
-  if is_enabled "${UPLOAD_RESULTS:-1}" && [[ -d "${RUN_OUTPUT_DIR}" ]]; then
+  if enabled "${UPLOAD_RESULTS:-1}" && [[ -d "${RUN_OUTPUT_DIR}" ]]; then
     if moxing_ok; then
       log "Uploading run outputs to ${OBS_RUN_OUTPUT_DIR}/"
       mox_copy_parallel "${RUN_OUTPUT_DIR%/}/" "${OBS_RUN_OUTPUT_DIR}/" 0
@@ -250,16 +212,9 @@ print_runtime_info() {
   log "conda_env_prefix=${CONDA_ENV_PREFIX}"
   log "obs_repo_root=${OBS_REPO_ROOT}"
   log "obs_data_root=${OBS_DATA_ROOT}"
-  log "obs_checkpoints_root=${OBS_CHECKPOINTS_ROOT}"
   log "obs_results_root=${OBS_RESULTS_ROOT}"
   log "moxing_wheel_obs_uri=${MOXING_WHEEL_OBS_URI}"
-  log "navsim_devkit_root=${NAVSIM_DEVKIT_ROOT}"
-  log "nuplan_devkit_package=${NUPLAN_DEVKIT_PACKAGE}"
-  log "task=${TASK}"
-  log "run_id=${RUN_ID}"
-  log "nproc_per_node=${NPROC_PER_NODE}"
-  log "smoke=${SMOKE}"
-  log "cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
+  log "task=${TASK} run_id=${RUN_ID} nproc_per_node=${NPROC_PER_NODE} smoke=${SMOKE} cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
   hostname || true
   pwd
   command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L || true
@@ -267,17 +222,14 @@ print_runtime_info() {
 
 prepare_conda_env() {
   [[ -d "${CONDA_ENV_PREFIX}" ]] || die "unpacked conda environment directory not found: ${CONDA_ENV_PREFIX}"
-  [[ -x "${CONDA_ENV_PREFIX}/bin/python" ]] || die "python not found in unpacked conda environment: ${CONDA_ENV_PREFIX}/bin/python"
-  [[ -f "${CONDA_ENV_PREFIX}/bin/activate" ]] || die "activate script not found in unpacked conda environment: ${CONDA_ENV_PREFIX}/bin/activate"
-
+  [[ -x "${CONDA_ENV_PREFIX}/bin/python" ]] || die "python not found: ${CONDA_ENV_PREFIX}/bin/python"
+  [[ -f "${CONDA_ENV_PREFIX}/bin/activate" ]] || die "activate script not found: ${CONDA_ENV_PREFIX}/bin/activate"
   # shellcheck source=/dev/null
   source "${CONDA_ENV_PREFIX}/bin/activate"
   log "Activated unpacked conda environment: ${CONDA_ENV_PREFIX}"
   if [[ -x "${CONDA_ENV_PREFIX}/bin/conda-unpack" ]]; then
-    log "Running conda-unpack"
     "${CONDA_ENV_PREFIX}/bin/conda-unpack"
   elif command -v conda-unpack >/dev/null 2>&1; then
-    log "Running conda-unpack"
     conda-unpack
   else
     die "conda-unpack not found after activating ${CONDA_ENV_PREFIX}"
@@ -286,161 +238,99 @@ prepare_conda_env() {
 }
 
 install_moxing_from_obs() {
-  if ! is_enabled "${INSTALL_MOXING_FROM_OBS:-1}"; then
+  if enabled "${INSTALL_MOXING_FROM_OBS:-1}"; then
+    install_moxing_wheel_from_obs "${REPO_ROOT}/${MOXING_WHEEL_NAME}" "[runtime]"
+    log "MoXing file API is available after wheel installation."
+  else
     log "INSTALL_MOXING_FROM_OBS=0, skip MoXing wheel installation."
-    return 0
   fi
-
-  local wheel_path="${REPO_ROOT}/${MOXING_WHEEL_NAME}"
-  log "Downloading MoXing wheel from ${MOXING_WHEEL_OBS_URI}"
-  python - "${MOXING_WHEEL_OBS_URI}" "${wheel_path}" <<'PY'
-import sys
-import moxing
-
-src, dst = sys.argv[1], sys.argv[2]
-moxing.file.copy(src, dst)
-PY
-
-  [[ -f "${wheel_path}" ]] || die "MoXing wheel download failed: ${wheel_path}"
-  log "Installing MoXing wheel: ${wheel_path}"
-  python -m pip install "${wheel_path}" --upgrade-strategy only-if-needed
-
-  moxing_ok || die "MoXing installation finished but mox.file is unavailable."
-  log "MoXing file API is available after wheel installation."
 }
 
 register_local_packages() {
   [[ -f "${NUPLAN_DEVKIT_PACKAGE}" || -d "${NUPLAN_DEVKIT_PACKAGE}" ]] || die "nuPlan devkit package not found: ${NUPLAN_DEVKIT_PACKAGE}"
   [[ -d "${NAVSIM_DEVKIT_ROOT}" ]] || die "NAVSIM devkit directory not found: ${NAVSIM_DEVKIT_ROOT}"
-
-  log "Registering vendored nuPlan devkit without dependency resolution"
   python -m pip install "${NUPLAN_DEVKIT_PACKAGE}" --no-deps
-
-  log "Registering vendored NAVSIM devkit without dependency resolution"
   python -m pip install -e "${NAVSIM_DEVKIT_ROOT}" --no-deps
-
-  log "Registering current repo in editable mode without dependency resolution"
   python -m pip install -e "${REPO_ROOT}" --no-deps
+}
+
+verify_runtime_environment() {
+  python - "${REPO_ROOT}" <<'PY'
+import sys
+from pathlib import Path
+repo_src = Path(sys.argv[1]) / "src"
+if repo_src.is_dir():
+    sys.path.insert(0, str(repo_src))
+import fastwam, navsim, nuplan
+import moxing as mox
+if not hasattr(mox, "file"):
+    raise RuntimeError("moxing is importable, but mox.file is unavailable")
+print("runtime imports:")
+print("  fastwam:", fastwam.__file__)
+print("  navsim:", navsim.__file__)
+print("  nuplan:", nuplan.__file__)
+print("  moxing:", mox.__file__)
+PY
 }
 
 sync_checkpoints() {
   mkdir -p "${DIFFSYNTH_MODEL_BASE_PATH}"
   local action_dit="${DIFFSYNTH_MODEL_BASE_PATH}/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"
-
-  if is_enabled "${SYNC_CHECKPOINTS:-1}"; then
-    if [[ -f "${action_dit}" ]] && ! is_enabled "${FORCE_SYNC_CHECKPOINTS:-0}"; then
-      log "Checkpoint directory already contains ActionDiT; skip OBS checkpoint sync. Set FORCE_SYNC_CHECKPOINTS=1 to resync."
+  if enabled "${SYNC_CHECKPOINTS:-1}"; then
+    if [[ -f "${action_dit}" ]] && ! enabled "${FORCE_SYNC_CHECKPOINTS:-0}"; then
+      log "Checkpoint directory already contains ActionDiT; skip OBS checkpoint sync."
     else
-      log "Syncing checkpoints from OBS"
       mox_copy_parallel "${OBS_CHECKPOINTS_ROOT%/}/" "${DIFFSYNTH_MODEL_BASE_PATH%/}/" 1
     fi
-  else
-    log "SYNC_CHECKPOINTS=0, skip checkpoint sync."
   fi
-
   [[ -f "${action_dit}" ]] || die "Missing ActionDiT checkpoint: ${action_dit}"
-  log "Checkpoint directory ready: ${DIFFSYNTH_MODEL_BASE_PATH}"
 }
 
 sync_or_build_text_embeds() {
-  local local_root="${REPO_ROOT}/data/text_embeds_cache"
-  local navsim_cache="${local_root}/navsim_v1"
+  local local_root="${REPO_ROOT}/data/text_embeds_cache" navsim_cache="${local_root}/navsim_v1"
   mkdir -p "${local_root}"
-
-  if is_enabled "${SYNC_TEXT_EMBEDS:-1}" && mox_path_exists "${OBS_TEXT_EMBEDS_ROOT}"; then
-    log "Syncing text embedding cache from OBS"
+  if enabled "${SYNC_TEXT_EMBEDS:-1}" && mox_path_exists "${OBS_TEXT_EMBEDS_ROOT}"; then
     mox_copy_parallel "${OBS_TEXT_EMBEDS_ROOT%/}/" "${local_root%/}/" 0
-  else
-    log "OBS text embedding cache not found or disabled; will rely on local/precompute path."
   fi
-
-  if [[ ! -d "${navsim_cache}" ]] && is_enabled "${PRECOMPUTE_TEXT_EMBEDS:-1}"; then
-    log "Precomputing NavSIM text embeddings"
-    python scripts/precompute_text_embeds.py \
-      "task=${TASK}" \
-      "data.storage.mode=obs" \
-      "data.storage.obs_root=${OBS_DATA_ROOT}" \
-      "overwrite=false"
-    if is_enabled "${UPLOAD_TEXT_EMBEDS:-1}" && [[ -d "${navsim_cache}" ]]; then
-      log "Uploading generated text embedding cache to OBS"
-      mox_copy_parallel "${local_root%/}/" "${OBS_TEXT_EMBEDS_ROOT%/}/" 0
-    fi
+  if [[ ! -d "${navsim_cache}" ]] && enabled "${PRECOMPUTE_TEXT_EMBEDS:-1}"; then
+    python scripts/precompute_text_embeds.py "task=${TASK}" "data.storage.mode=obs" "data.storage.obs_root=${OBS_DATA_ROOT}" "overwrite=false"
+    enabled "${UPLOAD_TEXT_EMBEDS:-1}" && [[ -d "${navsim_cache}" ]] && mox_copy_parallel "${local_root%/}/" "${OBS_TEXT_EMBEDS_ROOT%/}/" 0
   fi
-
   [[ -d "${navsim_cache}" ]] || die "Missing text embedding cache: ${navsim_cache}"
 }
 
 obs_smoke_check() {
-  log "Checking OBS data root"
   mox_list_directory "${OBS_DATA_ROOT}"
   mox_list_directory "${OBS_DATA_ROOT%/}/navsim_logs/trainval"
 }
 
 run_training() {
-  local train_args=(
-    "task=${TASK}"
-    "data.storage.mode=obs"
-    "data.storage.obs_root=${OBS_DATA_ROOT}"
-  )
-  if is_enabled "${SMOKE}"; then
-    train_args+=(
-      "data.train.max_scenes=2"
-      "data.val.max_scenes=2"
-      "eval_full_dataset=false"
-      "max_steps=2"
-      "num_epochs=1"
-      "save_every=1"
-      "eval_every=1"
-      "wandb.enabled=false"
-    )
+  local train_args=("task=${TASK}" "data.storage.mode=obs" "data.storage.obs_root=${OBS_DATA_ROOT}")
+  if enabled "${SMOKE}"; then
+    train_args+=("data.train.max_scenes=2" "data.val.max_scenes=2" "eval_full_dataset=false" "max_steps=2" "num_epochs=1" "save_every=1" "eval_every=1" "wandb.enabled=false")
   fi
   train_args+=("$@")
-
-  log "Starting training"
   bash scripts/train_zero1.sh "${NPROC_PER_NODE}" "${train_args[@]}"
 }
 
 find_latest_checkpoint() {
-  local weights_dir="${RUN_OUTPUT_DIR}/checkpoints/weights"
+  local weights_dir="${RUN_OUTPUT_DIR}/checkpoints/weights" checkpoint=""
   [[ -d "${weights_dir}" ]] || die "Checkpoint weights directory not found: ${weights_dir}"
-  local checkpoint
   checkpoint="$(find "${weights_dir}" -maxdepth 1 -type f -name 'step_*.pt' | sort -V | tail -n 1)"
   [[ -n "${checkpoint}" ]] || die "No step_*.pt checkpoint found in ${weights_dir}"
   printf '%s\n' "${checkpoint}"
 }
 
 run_navtest_evaluation() {
-  if ! is_enabled "${RUN_NAVTEST_EVAL:-1}"; then
-    log "RUN_NAVTEST_EVAL=0, skip navtest evaluation."
-    return 0
-  fi
-
-  local latest_checkpoint latest_step eval_output_dir
+  enabled "${RUN_NAVTEST_EVAL:-1}" || { log "RUN_NAVTEST_EVAL=0, skip navtest evaluation."; return 0; }
+  local latest_checkpoint latest_step eval_output_dir stats_path
   latest_checkpoint="$(find_latest_checkpoint)"
   latest_step="$(basename "${latest_checkpoint}" .pt)"
   eval_output_dir="${RUN_OUTPUT_DIR}/eval_navtest_${latest_step}"
-
-  local eval_args=(
-    "task=${TASK}"
-    "data.storage.mode=obs"
-    "data.storage.obs_root=${OBS_DATA_ROOT}"
-    "resume=${latest_checkpoint}"
-    "output_dir=${eval_output_dir}"
-  )
-
-  local stats_path="${RUN_OUTPUT_DIR}/dataset_stats.json"
-  if [[ -f "${stats_path}" ]]; then
-    eval_args+=("data.test.pretrained_norm_stats=${stats_path}")
-  fi
-
-  if is_enabled "${SMOKE}"; then
-    eval_args+=(
-      "data.test.max_scenes=4"
-      "+test_visualization.num_samples=4"
-    )
-  fi
-
-  log "Starting navtest evaluation with ${latest_checkpoint}"
+  stats_path="${RUN_OUTPUT_DIR}/dataset_stats.json"
+  local eval_args=("task=${TASK}" "data.storage.mode=obs" "data.storage.obs_root=${OBS_DATA_ROOT}" "resume=${latest_checkpoint}" "output_dir=${eval_output_dir}")
+  [[ -f "${stats_path}" ]] && eval_args+=("data.test.pretrained_norm_stats=${stats_path}")
+  enabled "${SMOKE}" && eval_args+=("data.test.max_scenes=4" "+test_visualization.num_samples=4")
   torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" scripts/evaluate_navsim.py "${eval_args[@]}"
 }
 
@@ -457,5 +347,4 @@ main() {
   run_navtest_evaluation
   log "DI NavSIM run finished: ${RUN_OUTPUT_DIR}"
 }
-
 main "$@"
