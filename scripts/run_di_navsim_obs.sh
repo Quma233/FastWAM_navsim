@@ -1,4 +1,51 @@
 #!/usr/bin/env bash
+
+echo "--------------bootstrap conda setup------------------"
+env
+BOOTSTRAP_CONDA_ENV="${BOOTSTRAP_CONDA_ENV:-qwen3}"
+
+__conda_setup="$('/root/miniconda3/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+if [ $? -eq 0 ]; then
+    eval "$__conda_setup"
+else
+    if [ -f "/root/miniconda3/etc/profile.d/conda.sh" ]; then
+        . "/root/miniconda3/etc/profile.d/conda.sh"
+    else
+        export PATH="/root/miniconda3/bin:$PATH"
+    fi
+fi
+unset __conda_setup
+
+echo "--------------activate qwen3------------------"
+conda activate "${BOOTSTRAP_CONDA_ENV}" || exit 1
+USE_JUICEFS=0
+
+function safe_mkdir() {
+  if [ ! -d $1 ]; then
+    mkdir $1
+  fi
+}
+
+function safe_multi_mkdir() {
+  if [ ! -d $1 ]; then
+    mkdir -p $1
+  fi
+}
+
+function lns() {
+  if [ ! -d $2 ]; then
+    ln -s $1 $2
+  fi
+}
+
+export S3_ENDPOINT="https://obs.cn-southwest-2.myhuaweicloud.com"
+export S3_USE_HTTPS="0"
+export ACCESS_KEY_ID="HPUACJ8EWHNONWBP1PGQ"
+export SECRET_ACCESS_KEY="rx3ITEWElWS8dZnPHmFMmMiiGkQ2pk5FguQ0d1QN"
+
+export WORKSPACE="${WORKSPACE:-/home/ma-user/code}"
+
+conda activate "${BOOTSTRAP_CONDA_ENV}" || exit 1
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,68 +60,39 @@ OBS_RESULTS_ROOT="${OBS_RESULTS_ROOT:-${OBS_REPO_ROOT}/runs}"
 MOXING_WHEEL_OBS_URI="${MOXING_WHEEL_OBS_URI:-obs://yw-ads-training-gy1/data/external/personal/z00009214/moxing_framework-2.5.0rc6-py2.py3-none-any.whl}"
 MOXING_WHEEL_NAME="${MOXING_WHEEL_NAME:-moxing_framework-2.5.0rc6-py2.py3-none-any.whl}"
 
-WORKSPACE="${WORKSPACE:-/home/ma-user/code}"
 LOCAL_REPO_ROOT="${LOCAL_REPO_ROOT:-${WORKSPACE}/FastWAM_navsim_di}"
-BOOTSTRAP_CONDA_ENV="${BOOTSTRAP_CONDA_ENV:-qwen3}"
-BOOTSTRAP_CONDA_BIN="${BOOTSTRAP_CONDA_BIN:-/root/miniconda3/bin/conda}"
-BOOTSTRAP_CONDA_SH="${BOOTSTRAP_CONDA_SH:-/root/miniconda3/etc/profile.d/conda.sh}"
 BOOTSTRAP_MOXING_WHEEL_PATH="${BOOTSTRAP_MOXING_WHEEL_PATH:-/tmp/${MOXING_WHEEL_NAME}}"
-
-export S3_ENDPOINT="${S3_ENDPOINT:-https://obs.cn-southwest-2.myhuaweicloud.com}"
-export S3_USE_HTTPS="${S3_USE_HTTPS:-0}"
-export ACCESS_KEY_ID="${ACCESS_KEY_ID:-HPUACJ8EWHNONWBP1PGQ}"
-export SECRET_ACCESS_KEY="${SECRET_ACCESS_KEY:-rx3ITEWElWS8dZnPHmFMmMiiGkQ2pk5FguQ0d1QN}"
 
 enabled() { case "${1:-}" in 1|true|TRUE|yes|YES|on|ON) return 0 ;; *) return 1 ;; esac; }
 
-moxing_ok() {
-  python - <<'PY' >/dev/null 2>&1
-import moxing as mox
-if not hasattr(mox, "file"):
-    raise SystemExit(1)
-PY
+download_moxing_wheel_from_obs() {
+  local wheel_path="$1" label="$2"
+  if [[ -f "${wheel_path}" ]]; then
+    echo "${label} using existing MoXing wheel: ${wheel_path}"
+    return 0
+  fi
+  echo "${label} downloading MoXing wheel: ${MOXING_WHEEL_OBS_URI} -> ${wheel_path}"
+  python -c "import sys, moxing; moxing.file.copy(sys.argv[1], sys.argv[2])" "${MOXING_WHEEL_OBS_URI}" "${wheel_path}"
+  [[ -f "${wheel_path}" ]] || { echo "${label} missing wheel: ${wheel_path}" >&2; exit 1; }
 }
 
-activate_bootstrap_env() {
-  [[ -n "${BOOTSTRAP_CONDA_ENV}" ]] || return 0
-  local hook=""
-  if [[ -x "${BOOTSTRAP_CONDA_BIN}" ]]; then
-    hook="$(${BOOTSTRAP_CONDA_BIN} shell.bash hook 2>/dev/null || true)"
-  elif command -v conda >/dev/null 2>&1; then
-    hook="$(conda shell.bash hook 2>/dev/null || true)"
-  fi
-  if [[ -n "${hook}" ]]; then
-    eval "${hook}"
-  elif [[ -f "${BOOTSTRAP_CONDA_SH}" ]]; then
-    # shellcheck source=/dev/null
-    . "${BOOTSTRAP_CONDA_SH}"
-  elif [[ -x "${BOOTSTRAP_CONDA_BIN}" ]]; then
-    export PATH="$(dirname "${BOOTSTRAP_CONDA_BIN}"):${PATH}"
-  elif ! command -v conda >/dev/null 2>&1; then
-    echo "[bootstrap] conda not found; cannot activate ${BOOTSTRAP_CONDA_ENV}" >&2
-    exit 1
-  fi
-  echo "[bootstrap] activating conda env: ${BOOTSTRAP_CONDA_ENV}"
-  conda activate "${BOOTSTRAP_CONDA_ENV}"
-  export FASTWAM_BOOTSTRAP_CONDA_ACTIVE=1
+install_moxing_wheel_from_local() {
+  local wheel_path="$1" label="$2"
+  [[ -f "${wheel_path}" ]] || { echo "${label} missing MoXing wheel: ${wheel_path}" >&2; exit 1; }
+  echo "${label} installing MoXing wheel: ${wheel_path}"
+  python -m pip install "${wheel_path}" --upgrade-strategy only-if-needed
+  python -c "import moxing as mox; print('${label} moxing:', getattr(mox, '__file__', None))"
 }
 
 install_moxing_wheel_from_obs() {
   local wheel_path="$1" label="$2"
-  moxing_ok || { echo "${label} moxing.file is required before downloading ${MOXING_WHEEL_NAME}" >&2; exit 1; }
-  echo "${label} downloading MoXing wheel: ${MOXING_WHEEL_OBS_URI} -> ${wheel_path}"
-  python - "${MOXING_WHEEL_OBS_URI}" "${wheel_path}" <<'PY'
-import sys
-import moxing
-moxing.file.copy(sys.argv[1], sys.argv[2])
-PY
-  [[ -f "${wheel_path}" ]] || { echo "${label} missing wheel: ${wheel_path}" >&2; exit 1; }
-  echo "${label} installing MoXing wheel: ${wheel_path}"
-  python -m pip install "${wheel_path}" --upgrade-strategy only-if-needed
-  moxing_ok || { echo "${label} moxing.file unavailable after wheel install" >&2; exit 1; }
+  echo "--------------${label} install moxing------------------"
+  download_moxing_wheel_from_obs "${wheel_path}" "${label}"
+  install_moxing_wheel_from_local "${wheel_path}" "${label}"
 }
 
 sync_repo_from_obs() {
+  echo "--------------sync repo from obs------------------"
   local src="${OBS_REPO_ROOT%/}/" dst="${LOCAL_REPO_ROOT%/}/"
   mkdir -p "$(dirname "${LOCAL_REPO_ROOT}")"
   echo "[bootstrap] syncing repo: ${src} -> ${dst}"
@@ -100,18 +118,19 @@ bootstrap_sync_repo_if_needed() {
   mkdir -p "${LOCAL_REPO_ROOT}"
   [[ "$(cd "${SCRIPT_REPO_ROOT}" && pwd -P)" == "$(cd "${LOCAL_REPO_ROOT}" && pwd -P)" ]] && return 0
 
-  activate_bootstrap_env
-  if enabled "${BOOTSTRAP_INSTALL_MOXING_FROM_OBS:-1}"; then
-    install_moxing_wheel_from_obs "${BOOTSTRAP_MOXING_WHEEL_PATH}" "[bootstrap]"
-  fi
+  echo "--------------copy repo from obs------------------"
   sync_repo_from_obs
-  if [[ "${FASTWAM_BOOTSTRAP_CONDA_ACTIVE:-0}" == "1" ]] && command -v conda >/dev/null 2>&1; then
-    echo "[bootstrap] deactivating conda env: ${BOOTSTRAP_CONDA_ENV}"
-    conda deactivate || true
-  fi
+  echo "--------------deactivate qwen3------------------"
+  conda deactivate || true
   export FASTWAM_DI_REPO_SYNCED=1
+  echo "--------------restart synced repo script------------------"
   exec bash "${LOCAL_REPO_ROOT}/scripts/run_di_navsim_obs.sh" "$@"
 }
+echo "--------------bootstrap update moxing------------------"
+if enabled "${BOOTSTRAP_INSTALL_MOXING_FROM_OBS:-1}"; then
+  install_moxing_wheel_from_obs "${BOOTSTRAP_MOXING_WHEEL_PATH}" "[bootstrap]"
+fi
+
 bootstrap_sync_repo_if_needed "$@"
 
 REPO_ROOT="${SCRIPT_REPO_ROOT}"
@@ -194,20 +213,18 @@ PY
 
 upload_results() {
   local exit_code=$?
+  echo "--------------copy run outputs to obs------------------"
   set +e
   if enabled "${UPLOAD_RESULTS:-1}" && [[ -d "${RUN_OUTPUT_DIR}" ]]; then
-    if moxing_ok; then
-      log "Uploading run outputs to ${OBS_RUN_OUTPUT_DIR}/"
-      mox_copy_parallel "${RUN_OUTPUT_DIR%/}/" "${OBS_RUN_OUTPUT_DIR}/" 0
-    else
-      log "Skip result upload because moxing is unavailable."
-    fi
+    log "Uploading run outputs to ${OBS_RUN_OUTPUT_DIR}/"
+    mox_copy_parallel "${RUN_OUTPUT_DIR%/}/" "${OBS_RUN_OUTPUT_DIR}/" 0
   fi
   exit "${exit_code}"
 }
 trap upload_results EXIT
 
 print_runtime_info() {
+  echo "--------------runtime info------------------"
   log "repo_root=${REPO_ROOT}"
   log "conda_env_prefix=${CONDA_ENV_PREFIX}"
   log "obs_repo_root=${OBS_REPO_ROOT}"
@@ -221,6 +238,7 @@ print_runtime_info() {
 }
 
 prepare_conda_env() {
+  echo "--------------activate fastwam env------------------"
   [[ -d "${CONDA_ENV_PREFIX}" ]] || die "unpacked conda environment directory not found: ${CONDA_ENV_PREFIX}"
   [[ -x "${CONDA_ENV_PREFIX}/bin/python" ]] || die "python not found: ${CONDA_ENV_PREFIX}/bin/python"
   [[ -f "${CONDA_ENV_PREFIX}/bin/activate" ]] || die "activate script not found: ${CONDA_ENV_PREFIX}/bin/activate"
@@ -238,8 +256,9 @@ prepare_conda_env() {
 }
 
 install_moxing_from_obs() {
+  echo "--------------update runtime moxing------------------"
   if enabled "${INSTALL_MOXING_FROM_OBS:-1}"; then
-    install_moxing_wheel_from_obs "${REPO_ROOT}/${MOXING_WHEEL_NAME}" "[runtime]"
+    install_moxing_wheel_from_local "${BOOTSTRAP_MOXING_WHEEL_PATH}" "[runtime]"
     log "MoXing file API is available after wheel installation."
   else
     log "INSTALL_MOXING_FROM_OBS=0, skip MoXing wheel installation."
@@ -247,6 +266,7 @@ install_moxing_from_obs() {
 }
 
 register_local_packages() {
+  echo "--------------register local packages------------------"
   [[ -f "${NUPLAN_DEVKIT_PACKAGE}" || -d "${NUPLAN_DEVKIT_PACKAGE}" ]] || die "nuPlan devkit package not found: ${NUPLAN_DEVKIT_PACKAGE}"
   [[ -d "${NAVSIM_DEVKIT_ROOT}" ]] || die "NAVSIM devkit directory not found: ${NAVSIM_DEVKIT_ROOT}"
   python -m pip install "${NUPLAN_DEVKIT_PACKAGE}" --no-deps
@@ -255,6 +275,7 @@ register_local_packages() {
 }
 
 verify_runtime_environment() {
+  echo "--------------verify runtime environment------------------"
   python - "${REPO_ROOT}" <<'PY'
 import sys
 from pathlib import Path
@@ -263,8 +284,6 @@ if repo_src.is_dir():
     sys.path.insert(0, str(repo_src))
 import fastwam, navsim, nuplan
 import moxing as mox
-if not hasattr(mox, "file"):
-    raise RuntimeError("moxing is importable, but mox.file is unavailable")
 print("runtime imports:")
 print("  fastwam:", fastwam.__file__)
 print("  navsim:", navsim.__file__)
@@ -274,6 +293,7 @@ PY
 }
 
 sync_checkpoints() {
+  echo "--------------copy checkpoints------------------"
   mkdir -p "${DIFFSYNTH_MODEL_BASE_PATH}"
   local action_dit="${DIFFSYNTH_MODEL_BASE_PATH}/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"
   if enabled "${SYNC_CHECKPOINTS:-1}"; then
@@ -287,6 +307,7 @@ sync_checkpoints() {
 }
 
 sync_or_build_text_embeds() {
+  echo "--------------prepare text embeddings------------------"
   local local_root="${REPO_ROOT}/data/text_embeds_cache" navsim_cache="${local_root}/navsim_v1"
   mkdir -p "${local_root}"
   if enabled "${SYNC_TEXT_EMBEDS:-1}" && mox_path_exists "${OBS_TEXT_EMBEDS_ROOT}"; then
@@ -300,11 +321,13 @@ sync_or_build_text_embeds() {
 }
 
 obs_smoke_check() {
+  echo "--------------obs data smoke check------------------"
   mox_list_directory "${OBS_DATA_ROOT}"
   mox_list_directory "${OBS_DATA_ROOT%/}/navsim_logs/trainval"
 }
 
 run_training() {
+  echo "--------------train begin------------------"
   local train_args=("task=${TASK}" "data.storage.mode=obs" "data.storage.obs_root=${OBS_DATA_ROOT}")
   if enabled "${SMOKE}"; then
     train_args+=("data.train.max_scenes=2" "data.val.max_scenes=2" "eval_full_dataset=false" "max_steps=2" "num_epochs=1" "save_every=1" "eval_every=1" "wandb.enabled=false")
@@ -322,6 +345,7 @@ find_latest_checkpoint() {
 }
 
 run_navtest_evaluation() {
+  echo "--------------navtest eval------------------"
   enabled "${RUN_NAVTEST_EVAL:-1}" || { log "RUN_NAVTEST_EVAL=0, skip navtest evaluation."; return 0; }
   local latest_checkpoint latest_step eval_output_dir stats_path
   latest_checkpoint="$(find_latest_checkpoint)"
